@@ -56,20 +56,16 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
     for i, (run_name, model_data) in enumerate(datasets):
         step_val = int((i / total_runs) * 100)
         
+        # --- Point 2: Dynamic Progress Bar ---
         progress_bar.progress(step_val, text=f"Processing **{run_name}**: Preparing Matrix...")
         
         try:
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
             
-            # --- Data Preprocessing ---
-            model_data[gen_col] = model_data[gen_col].astype(str)
-            model_data[row_col] = model_data[row_col].astype(str)
-            model_data[col_col] = model_data[col_col].astype(str)
-
-            # Check for sufficient unique genotypes
+            # Ensure enough data for modeling
             if model_data[gen_col].nunique() < 2:
                  debug_log.append(f"ERROR in {run_name}: Not enough unique genotypes ({model_data[gen_col].nunique()}) to run the model.")
-                 raise ValueError("Not enough unique genotypes.")
+                 continue
 
             # Create Unique Spatial IDs
             model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
@@ -79,10 +75,10 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             # Formula Logic
             if not analyze_separate and model_data[expt_col].nunique() > 1:
                 formula = f"{trait} ~ C({expt_col})"
-                fixed_effects_formula = f"Fixed Effects: {trait} ~ C({expt_col}) (Corrects for baseline differences between sites/years)"
+                fixed_effects_formula = f"Fixed Effects: {trait} ~ C({expt_col})"
             else:
                 formula = f"{trait} ~ 1"
-                fixed_effects_formula = f"Fixed Effects: {trait} ~ Intercept (Overall average trait performance)"
+                fixed_effects_formula = f"Fixed Effects: {trait} ~ Intercept"
 
             # Variance Components (Random Effects)
             vc = {
@@ -92,122 +88,69 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             }
             random_effects_formula = f"Random Effects: (1|{gen_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
-            debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
+            # --- Point 4: Model Details in Log ---
+            debug_log.append(f"--- {run_name} Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
             
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
             
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
-            # Use 'powell' only if 'lbfgs' or 'nm' (default) fail to converge, but sticking to powell for consistency here.
-            result = model.fit(method='powell', reml=True) 
+            result = model.fit(method='powell', reml=True) # Use Powell for more robust convergence
             
-            # --- STEP 1: LOG SUMMARY ---
-            debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
-
-            # --- STEP 2: BLUP EXTRACTION (Fix Implemented Here) ---
-            if not result.random_effects or 1 not in result.random_effects:
-                 raise ValueError("Model failed to estimate random effects (BLUPs).")
-
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
-            # When using vc_formula, the BLUPs are stored in a Series within the dict, 
-            # keyed by the name used in vc (i.e., 'Genotype').
-            geno_series = result.random_effects[1].get('Genotype')
+            # --- Point 3: Extract & Clean Genotype BLUPs ---
+            re_dict = result.random_effects[1]
+            geno_blups = {}
             
-            if geno_series is None or not isinstance(geno_series, pd.Series):
-                 # Fallback: Check if the key was slightly different (e.g. if gen_col was 'Hybrid')
-                 # But for simplicity and based on user feedback, we assume 'Genotype' is the key
-                 raise ValueError("Could not find 'Genotype' random effects component for BLUP extraction.")
+            for key, val in re_dict.items():
+                if key.startswith("Genotype["):
+                    # Use regex to extract only the genotype name, which is always in the last square brackets
+                    match = re.search(r'\[(.*?)\]$', key)
+                    name = match.group(1) if match else key
+                    geno_blups[name] = val
 
-            # The Series index IS the Genotype name, and the value IS the BLUP
-            geno_blups = geno_series.to_dict() 
-            
-            # Create BLUP DataFrame
+            # Create DataFrame
             temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
             temp_df.index.name = 'Genotype'
             
             # Add Intercept (Fixed Effect Mean)
-            # Find the correct fixed effect mean (Intercept or C(ExptID)[T.Name])
-            intercept = 0
-            if model_data[expt_col].nunique() > 1 and not analyze_separate:
-                # Use the mean of the fixed effects if multiple groups were fit
-                intercept = result.params.filter(regex=f'C\({expt_col}\)').mean()
-                if pd.isna(intercept): # Fall back to Intercept if filtered mean is NA
-                     intercept = result.params.get('Intercept', 0)
-            else:
-                 intercept = result.params.get('Intercept', 0)
-
-
+            intercept = result.params.get('Intercept', 0)
             temp_df[f'Predicted_{trait}'] = temp_df[f'BLUP_{trait}'] + intercept
             temp_df['Analysis_Group'] = run_name
             
             results_container.append(temp_df)
+            debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
+
+            # --- Point 6: Calculate Experiment-Wide Statistics ---
+            v_g = result.varmix.get(f"Genotype[C({gen_col})]")
+            v_e = result.scale # Residual variance
             
-            # --- STEP 3: EXPERIMENT-WIDE STATS CALCULATION (The potentially failing part) ---
-            
-            # Default values in case the statistical extraction fails
             h2 = 'N/A'
-            Vg_val = 'N/A'
-            Ve_val = 'N/A'
-            
-            try:
-                # --- This block needs to be robust against missing varmix ---
+            if v_g is not None and v_e is not None and model_data[gen_col].nunique() > 1:
+                # Avg replication estimate based on total plots / total unique genotypes
+                avg_plots_per_geno = model_data.groupby(gen_col).size().mean()
                 
-                # The Genotype variance component is typically accessible via the key "Genotype" (the VC name)
-                v_g = result.varmix.get("Genotype", None)
-                v_e = result.scale # Residual variance
-                
-                Ve_val = round(v_e, 3)
-                
-                if v_g is not None and model_data[gen_col].nunique() > 1:
-                    Vg_val = round(v_g, 3) 
-                    
-                    # Avg replication estimate based on total plots / total unique genotypes
-                    avg_plots_per_geno = model_data.groupby(gen_col).size().mean()
-                    
-                    # Formula: H^2 = Vg / ( Vg + Ve / n_plots)
-                    h2_val = v_g / (v_g + (v_e / avg_plots_per_geno))
-                    h2 = round(h2_val * 100, 1)
+                # Formula: H^2 = Vg / ( Vg + Ve / n_plots)
+                h2_val = v_g / (v_g + (v_e / avg_plots_per_geno))
+                h2 = round(h2_val * 100, 1)
 
-            except Exception as e:
-                # If varmix fails, we log it but continue since BLUPs are already extracted
-                debug_log.append(f"🚨 WARNING in {run_name}: Failed to extract Variance Components (Vg/H2) from 'varmix': {str(e)}. BLUPs were still successfully calculated.")
-                Vg_val = 'FAILED'
-                Ve_val = 'FAILED'
-                h2 = 'FAILED'
-
-            # Calculate basic stats (these should always work)
             mean = model_data[trait].mean()
             std_dev = model_data[trait].std()
             cv = (std_dev / mean) * 100 if mean != 0 else 0
             
-            # Append results to summary_stats (will contain N/A or FAILED if stats failed)
             summary_stats.append({
                 'Experiment ID': run_name,
                 'Mean': round(mean, 3),
                 'CV (%)': round(cv, 1),
-                'Genotype Var (Vg)': Vg_val,
-                'Residual Var (Ve)': Ve_val,
+                'Genotype Var (Vg)': round(v_g, 3) if v_g is not None else 'N/A',
+                'Residual Var (Ve)': round(v_e, 3),
                 'Est. Heritability (H2, %)': h2,
                 'Plots': len(model_data),
                 'Unique Genotypes': model_data[gen_col].nunique()
             })
             
         except Exception as e:
-            # This catch block is for critical failures (e.g., model fitting failed or not enough unique genotypes)
-            error_message = f"MODEL FAILED: {str(e)}"
-            debug_log.append(f"🚨 CRITICAL ERROR in {run_name}: {error_message}. Check raw data for NaNs, zero variance, or singular matrix.")
-            
-            summary_stats.append({
-                'Experiment ID': run_name,
-                'Mean': model_data[trait].mean() if 'model_data' in locals() and not model_data.empty else 'N/A',
-                'CV (%)': 'N/A',
-                'Genotype Var (Vg)': 'CRITICAL FAILED',
-                'Residual Var (Ve)': 'CRITICAL FAILED',
-                'Est. Heritability (H2, %)': 'CRITICAL FAILED',
-                'Plots': len(model_data) if 'model_data' in locals() else 0,
-                'Unique Genotypes': model_data[gen_col].nunique() if 'model_data' in locals() else 0
-            })
-            continue
+            debug_log.append(f"ERROR in {run_name}: {str(e)}")
     
     progress_bar.progress(100, text="Finalizing Results...")
     time.sleep(0.5)
@@ -219,7 +162,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         final_df = pd.concat(results_container)
         return True, final_df, stats_df, "\n".join(debug_log)
     else:
-        return False, pd.DataFrame(columns=['Genotype', f'BLUP_{trait}', f'Predicted_{trait}', 'Analysis_Group']), stats_df, "\n".join(debug_log)
+        return False, None, stats_df, "\n".join(debug_log)
 
 def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
     """
@@ -227,17 +170,9 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
     """
     progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
     
-    debug_output = "" # Initialize output string
-    
     try:
         model_data = df.dropna(subset=[trait, male_col, female_col, row_col, col_col]).copy()
         
-        # --- Data Preprocessing ---
-        model_data[male_col] = model_data[male_col].astype(str)
-        model_data[female_col] = model_data[female_col].astype(str)
-        model_data[row_col] = model_data[row_col].astype(str)
-        model_data[col_col] = model_data[col_col].astype(str)
-
         # Create Unique Spatial IDs
         model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
         model_data["Unique_Col"] = model_data[expt_col].astype(str) + "_" + model_data[col_col].astype(str)
@@ -263,26 +198,23 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         progress_bar.progress(50, text="Fitting Parental Model...")
         model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
         result = model.fit(method='powell', reml=True)
-
-        debug_output += f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
-        debug_output += f"--- GCA Model Summary ---\n{result.summary().as_text()}"
-
-        if not result.random_effects or 1 not in result.random_effects:
-             raise ValueError("Model failed to estimate random effects (GCA).")
         
         progress_bar.progress(80, text="Extracting GCA Values...")
         
         re_dict = result.random_effects[1]
         
-        # Use the explicit VC keys
-        male_series = re_dict.get('Male_GCA')
-        female_series = re_dict.get('Female_GCA')
-
-        if male_series is None or female_series is None:
-            raise ValueError("Could not find 'Male_GCA' or 'Female_GCA' random effects components.")
-
-        male_gca = male_series.to_dict()
-        female_gca = female_series.to_dict()
+        male_gca = {}
+        female_gca = {}
+        
+        # --- Point 3: Extract & Clean GCA Names ---
+        for key, val in re_dict.items():
+            match = re.search(r'\[(.*?)\]$', key)
+            name = match.group(1) if match else key
+            
+            if key.startswith("Male_GCA["):
+                male_gca[name] = val
+            elif key.startswith("Female_GCA["):
+                female_gca[name] = val
                 
         df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
         df_male.index.name = 'Male Parent'
@@ -291,13 +223,15 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         
         progress_bar.empty()
         
+        # --- Point 4: Statistical Output ---
+        debug_output = f"--- Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
+        debug_output += f"--- Model Summary ---\n{result.summary().as_text()}"
+        
         return True, df_male, df_female, debug_output
         
     except Exception as e:
         progress_bar.empty()
-        # Log the full error to the output
-        debug_output += f"🚨 CRITICAL GCA Model Failure: {str(e)}"
-        return False, None, None, debug_output
+        return False, None, None, str(e)
 
 # --- MAIN APP ---
 
@@ -311,8 +245,6 @@ def main():
         st.session_state.debug_log = None
     if 'analysis_mode' not in st.session_state:
         st.session_state.analysis_mode = "Analyze experiments separately"
-    if 'trait_ran' not in st.session_state:
-        st.session_state.trait_ran = None
 
 
     st.title("🧬 Plant Breeding Trial Analytics")
@@ -341,13 +273,13 @@ def main():
         
         all_cols = ["Select Column..."] + df.columns.tolist()
         
-        # --- Required Columns ---
+        # --- Point 1: Change label to "Genotype" ---
         col_map['expt'] = st.sidebar.selectbox("Experiment ID", all_cols)
         col_map['geno'] = st.sidebar.selectbox("Genotype", all_cols)
         col_map['row'] = st.sidebar.selectbox("Plot Row", all_cols)
         col_map['col'] = st.sidebar.selectbox("Plot Column", all_cols)
         
-        # --- Optional Parent Columns ---
+        # --- Point 1: Optional Parent Columns with Info Bubble ---
         with st.sidebar.expander("GCA Parental Lines (Optional)"):
             col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
             col_map['female'] = st.selectbox("Female Parent (Required for GCA)", all_cols)
@@ -383,6 +315,7 @@ def main():
     df_clean, cleaning_log = clean_curveballs(df_filtered, selected_traits)
 
     # --- TABS ---
+    # --- Point 1: GCA Tab Label based on status ---
     gca_tab_title = f"👨‍👩‍👧 Parental GCA ({'Ready' if gca_enabled else 'Disabled'})"
     tab_qc, tab_spatial, tab_perf, tab_parents = st.tabs([
         "🛡️ QC & Cleaning", 
@@ -409,6 +342,7 @@ def main():
         with c_stats:
             st.markdown(f"**Selected Experiments:** `{len(selected_expts)}`")
             st.markdown(f"**Total Plots:** `{len(df_clean)}`")
+            # --- Point 1: Change to "Genotypes" ---
             st.markdown(f"**Unique Genotypes:** `{df_clean[col_map['geno']].nunique()}`")
         
         with c_missing:
@@ -437,38 +371,28 @@ def main():
     with tab_perf:
         st.header("Genotype Performance Analysis (BLUPs)")
         
-        with st.expander("Understanding the Statistical Analysis: Fixed vs. Random Effects"):
+        # --- Point 5: Information Bubble ---
+        with st.expander("Understanding the Statistical Analysis (BLUPs)"):
             st.markdown("""
-            The analysis uses a **Linear Mixed Model (LMM)** to calculate **Best Linear Unbiased Predictions (BLUPs)**. This method is the gold standard for separating true genetic merit from field noise. 
+            This analysis uses a Linear Mixed Model (LMM) with spatial correction to calculate Best Linear Unbiased Predictions (BLUPs).
             
+            **Why use BLUPs?**
+            In field trials, plot yield is affected by genetics (the genotype) and non-genetic factors (soil variability, pests, etc.). BLUPs are a statistical method that separates the true genetic performance of a genotype from these environmental 'noise' effects.
             
-
-            ### Fixed Effects vs. Random Effects
+            **How it works (in simple terms):**
+            1. **Spatial Correction:** The model looks at adjacent plots (rows and columns) and estimates a spatial trend across the entire field. It then removes this trend, correcting for local soil differences or field gradients.
+            2. **Genotype Value:** After correcting for spatial variation, the model estimates the 'true' breeding value for each genotype (the BLUP). This value is adjusted based on how many times the genotype was tested (replicates) and how consistent its performance was across the trial.
             
-            A Mixed Model splits the sources of variation into two types:
-            
-            * **Fixed Effects (Known, Non-Variable Factors):**
-                These are effects we want to *estimate* precisely. They usually represent known, deliberate differences in the experimental design.
-                * **Example:** The overall average performance (Intercept) or the average difference between two different testing **environments/experiments** (if combining trials). We assume all genotypes will be affected by these factors in the same way.
-            
-            * **Random Effects (Unknown, Variable Factors):**
-                These are effects we want to *predict* (BLUPs) or account for in the error term. We assume they are drawn from a normal distribution and vary unpredictably.
-                * **Genotype:** This is treated as a random effect because we want to predict the **true breeding value (BLUP)** for each genotype, which is a prediction of its performance if tested infinitely.
-                * **Spatial Correction (Row/Column):** Field variation (e.g., a wet patch or soil gradient) is random across the field. We model this as a random effect to remove its influence, leading to cleaner genotype estimates.
-            
-            ### How BLUPs Work (The Prediction)
-            
-            1.  **Field Correction:** The model uses the spatial random effects (Plot Row and Plot Column) to map the field's environmental noise. This noise is mathematically subtracted from your raw plot data.
-            2.  **Genetic Prediction:** The corrected data is then used to predict the value for the Genotype random effect. This prediction is the **BLUP**. The model 'shrinks' the estimates of poorly-replicated or highly variable genotypes toward the overall mean, making the high-performing, consistent genotypes stand out.
-            3.  **Final Value:** The final **Predicted Trait Value** reported in the tables is the Genotype BLUP plus the relevant Fixed Effect (e.g., the overall experiment mean).
+            The final **Predicted Trait Value** is the Genotype BLUP added back to the overall mean of the trial.
             """)
         
         col_opts, col_act = st.columns([2, 1])
         perf_trait = col_opts.selectbox("Trait to Analyze", selected_traits, key='perf_trait')
         
+        # Use session state for analysis mode so it persists
         def update_analysis_mode():
             st.session_state.analysis_mode = st.session_state.temp_analysis_mode
-            st.session_state.results_df = None
+            st.session_state.results_df = None # Clear results when mode changes
 
         analysis_mode = col_opts.radio(
             "Analysis Strategy", 
@@ -488,41 +412,31 @@ def main():
             success, res_df, stats_df, debug = run_hybrid_model(
                 df_clean, perf_trait, col_map['geno'], col_map['row'], col_map['col'], col_map['expt'], separate_flag
             )
+            # Store results in session state
             st.session_state.results_df = res_df
             st.session_state.stats_df = stats_df
             st.session_state.debug_log = debug
-            st.session_state.trait_ran = perf_trait
-            st.session_state.analysis_mode_ran = st.session_state.analysis_mode 
+            st.session_state.perf_trait = perf_trait
+            st.session_state.analysis_mode_ran = st.session_state.analysis_mode # store the mode that produced the results
             
         
         # Display Results if available
-        if st.session_state.stats_df is not None:
+        if st.session_state.results_df is not None:
+            res_df = st.session_state.results_df
+            perf_trait = st.session_state.perf_trait
             
-            st.subheader(f"Results for: {st.session_state.trait_ran}")
+            st.subheader(f"Results for: {perf_trait}")
 
-            # Experiment-Wide Statistics Table (Guaranteed to show, even with failures)
+            # --- Point 6: Experiment-Wide Statistics Table ---
             if not st.session_state.stats_df.empty:
                 st.markdown("##### Experiment-Wide Statistical Summary")
                 st.dataframe(st.session_state.stats_df, use_container_width=True)
-                st.markdown(
-                    """
-                    *Note: Entries with 'FAILED' or 'CRITICAL FAILED' indicate the statistical model's post-estimation process (calculating $V_g$ and $H^2$) 
-                    failed due to numerical instability, even if the model successfully extracted BLUPs.*
-                    """
-                )
                 st.markdown("---")
-            else:
-                st.warning("No statistical data was generated. Check the Debug Log below.")
 
-
-        if st.session_state.results_df is not None and not st.session_state.results_df.empty:
-            res_df = st.session_state.results_df
-            perf_trait_ran = st.session_state.trait_ran
-            
             current_view_df = res_df.copy()
             download_df = res_df.copy()
-            selected_group = "All Combined"
 
+            # --- Point 2: Toggling Results for Separate Analysis ---
             if st.session_state.analysis_mode_ran == "Analyze experiments separately" and len(res_df['Analysis_Group'].unique()) > 1:
                 unique_groups = ["All Combined"] + res_df['Analysis_Group'].unique().tolist()
                 selected_group = st.selectbox("View Results By Experiment", unique_groups)
@@ -537,15 +451,15 @@ def main():
                 st.markdown("**Showing results for:** Combined Analysis")
 
             # Final Display
-            current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait_ran}", ascending=False)
+            current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait}", ascending=False)
             
-            st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait_ran})")
+            st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait})")
             fig = px.bar(
                 current_view_df.head(20),
-                x=f"Predicted_{perf_trait_ran}",
+                x=f"Predicted_{perf_trait}",
                 y=current_view_df.head(20).index,
                 orientation='h',
-                title=f"Top Genotypes: {perf_trait_ran}"
+                title=f"Top Genotypes: {perf_trait}"
             )
             fig.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig, use_container_width=True)
@@ -553,10 +467,11 @@ def main():
             st.markdown("##### Full Results Table")
             st.dataframe(current_view_df)
             
+            # --- Point 2: Download Options ---
             st.download_button(
                 "Download All Combined Results (CSV)", 
                 res_df.to_csv().encode('utf-8'), 
-                f"All_Genotype_BLUPs_{perf_trait_ran}.csv",
+                f"All_Genotype_BLUPs_{perf_trait}.csv",
                 key='dl_all_blups'
             )
             
@@ -564,22 +479,18 @@ def main():
                  st.download_button(
                     f"Download {selected_group} Results Only (CSV)", 
                     download_df.to_csv().encode('utf-8'), 
-                    f"{selected_group}_BLUPs_{perf_trait_ran}.csv",
+                    f"{selected_group}_BLUPs_{perf_trait}.csv",
                     key='dl_single_blup'
                 )
 
-        else:
-             st.error("Model results table is empty. Check the 'Experiment-Wide Statistical Summary' above for 'FAILED' entries and review the Complete Statistical Model Output below for error messages.")
-
-
-        if st.session_state.debug_log:
-             with st.expander("Complete Statistical Model Output (Debug)"):
+            # --- Point 4: Statistical Output ---
+            with st.expander("Complete Statistical Model Output (Debug)"):
                 st.text(st.session_state.debug_log)
-        
 
 
     # --- TAB 4: PARENTAL GCA ---
     with tab_parents:
+        # --- Point 1: Greyed out logic and explanation ---
         if not gca_enabled:
             st.header("Parental GCA (General Combining Ability) Disabled")
             st.error("GCA analysis requires both the 'Male Parent' and 'Female Parent' columns to be selected in the sidebar map.")
@@ -587,7 +498,7 @@ def main():
         else:
             st.header("Parental GCA (General Combining Ability)")
             st.markdown("""
-            **Statistical Rigor:** This module fits a Linear Mixed Model: `Trait ~ FixedEffects(e.g., ExperimentID) + RandomEffects(1|Male) + RandomEffects(1|Female) + SpatialCorrection`.
+            **Statistical Rigor:** This module fits a Linear Mixed Model: `Trait ~ (1|Male) + (1|Female) + SpatialCorrection`.
             This isolates the true genetic breeding value (GCA) of the parents.
             """)
             
@@ -599,14 +510,6 @@ def main():
                 )
                 
                 if success:
-                    st.markdown("""
-                    ### GCA Interpretation
-                    
-                    
-                    * **Positive GCA:** The parent contributes positively to the hybrid's performance. These are the best parents for that trait.
-                    * **Negative GCA:** The parent contributes negatively.
-                    """)
-
                     c_male, c_fem = st.columns(2)
                     
                     c_male.subheader(f"Male GCA (Trait: {gca_trait})")
@@ -633,9 +536,8 @@ def main():
                     with st.expander("Complete GCA Model Output (Debug)"):
                         st.text(debug)
                 else:
-                    st.error("GCA Model Failed. Check the debug output.")
-                    with st.expander("Complete GCA Model Output (Debug)"):
-                        st.text(debug)
+                    st.error("GCA Model Failed")
+                    st.text(debug)
 
 if __name__ == "__main__":
     main()
