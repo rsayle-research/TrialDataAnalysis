@@ -74,11 +74,13 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
             # Formula Logic
             if not analyze_separate and model_data[expt_col].nunique() > 1:
+                # Fixed Effect: Experiment ID (used when combining multiple experiments)
                 formula = f"{trait} ~ C({expt_col})"
-                fixed_effects_formula = f"Fixed Effects: {trait} ~ C({expt_col})"
+                fixed_effects_formula = f"Fixed Effects: {trait} ~ C({expt_col}) (Corrects for baseline differences between sites/years)"
             else:
+                # Fixed Effect: Intercept (Overall Mean of the single experiment)
                 formula = f"{trait} ~ 1"
-                fixed_effects_formula = f"Fixed Effects: {trait} ~ Intercept"
+                fixed_effects_formula = f"Fixed Effects: {trait} ~ Intercept (Overall average trait performance)"
 
             # Variance Components (Random Effects)
             vc = {
@@ -89,7 +91,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             random_effects_formula = f"Random Effects: (1|{gen_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
             # --- Point 4: Model Details in Log ---
-            debug_log.append(f"--- {run_name} Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
+            debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
             
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
             
@@ -224,8 +226,8 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         progress_bar.empty()
         
         # --- Point 4: Statistical Output ---
-        debug_output = f"--- Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
-        debug_output += f"--- Model Summary ---\n{result.summary().as_text()}"
+        debug_output = f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
+        debug_output += f"--- GCA Model Summary ---\n{result.summary().as_text()}"
         
         return True, df_male, df_female, debug_output
         
@@ -245,6 +247,9 @@ def main():
         st.session_state.debug_log = None
     if 'analysis_mode' not in st.session_state:
         st.session_state.analysis_mode = "Analyze experiments separately"
+    # New state variable to store the trait that successfully ran the analysis (Fixes StreamlitAPIException)
+    if 'trait_ran' not in st.session_state:
+        st.session_state.trait_ran = None
 
 
     st.title("🧬 Plant Breeding Trial Analytics")
@@ -281,6 +286,7 @@ def main():
         
         # --- Point 1: Optional Parent Columns with Info Bubble ---
         with st.sidebar.expander("GCA Parental Lines (Optional)"):
+            st.info("GCA analysis can be performed if parental lines are selected for hybrid crops.")
             col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
             col_map['female'] = st.selectbox("Female Parent (Required for GCA)", all_cols)
         
@@ -371,19 +377,29 @@ def main():
     with tab_perf:
         st.header("Genotype Performance Analysis (BLUPs)")
         
-        # --- Point 5: Information Bubble ---
-        with st.expander("Understanding the Statistical Analysis (BLUPs)"):
+        # --- Point 5: Information Bubble (Enhanced) ---
+        with st.expander("Understanding the Statistical Analysis: Fixed vs. Random Effects"):
             st.markdown("""
-            This analysis uses a Linear Mixed Model (LMM) with spatial correction to calculate Best Linear Unbiased Predictions (BLUPs).
+            The analysis uses a **Linear Mixed Model (LMM)** to calculate **Best Linear Unbiased Predictions (BLUPs)**. This method is the gold standard for separating true genetic merit from field noise. 
             
-            **Why use BLUPs?**
-            In field trials, plot yield is affected by genetics (the genotype) and non-genetic factors (soil variability, pests, etc.). BLUPs are a statistical method that separates the true genetic performance of a genotype from these environmental 'noise' effects.
+            ### Fixed Effects vs. Random Effects
             
-            **How it works (in simple terms):**
-            1. **Spatial Correction:** The model looks at adjacent plots (rows and columns) and estimates a spatial trend across the entire field. It then removes this trend, correcting for local soil differences or field gradients.
-            2. **Genotype Value:** After correcting for spatial variation, the model estimates the 'true' breeding value for each genotype (the BLUP). This value is adjusted based on how many times the genotype was tested (replicates) and how consistent its performance was across the trial.
+            A Mixed Model splits the sources of variation into two types:
             
-            The final **Predicted Trait Value** is the Genotype BLUP added back to the overall mean of the trial.
+            * **Fixed Effects (Known, Non-Variable Factors):**
+                These are effects we want to *estimate* precisely. They usually represent known, deliberate differences in the experimental design.
+                * **Example:** The overall average performance (Intercept) or the average difference between two different testing **environments/experiments** (if combining trials). We assume all genotypes will be affected by these factors in the same way.
+            
+            * **Random Effects (Unknown, Variable Factors):**
+                These are effects we want to *predict* (BLUPs) or account for in the error term. We assume they are drawn from a normal distribution and vary unpredictably.
+                * **Genotype:** This is treated as a random effect because we want to predict the **true breeding value (BLUP)** for each genotype, which is a prediction of its performance if tested infinitely.
+                * **Spatial Correction (Row/Column):** Field variation (e.g., a wet patch or soil gradient) is random across the field. We model this as a random effect to remove its influence, leading to cleaner genotype estimates.
+            
+            ### How BLUPs Work (The Prediction)
+            
+            1.  **Field Correction:** The model uses the spatial random effects (Plot Row and Plot Column) to map the field's environmental noise. This noise is mathematically subtracted from your raw plot data.
+            2.  **Genetic Prediction:** The corrected data is then used to predict the value for the Genotype random effect. This prediction is the **BLUP**. The model 'shrinks' the estimates of poorly-replicated or highly variable genotypes toward the overall mean, making the high-performing, consistent genotypes stand out.
+            3.  **Final Value:** The final **Predicted Trait Value** reported in the tables is the Genotype BLUP plus the relevant Fixed Effect (e.g., the overall experiment mean).
             """)
         
         col_opts, col_act = st.columns([2, 1])
@@ -412,20 +428,20 @@ def main():
             success, res_df, stats_df, debug = run_hybrid_model(
                 df_clean, perf_trait, col_map['geno'], col_map['row'], col_map['col'], col_map['expt'], separate_flag
             )
-            # Store results in session state
+            # Store results in session state, using 'trait_ran' to avoid conflict with the 'perf_trait' widget key
             st.session_state.results_df = res_df
             st.session_state.stats_df = stats_df
             st.session_state.debug_log = debug
-            st.session_state.perf_trait = perf_trait
-            st.session_state.analysis_mode_ran = st.session_state.analysis_mode # store the mode that produced the results
+            st.session_state.trait_ran = perf_trait # Store the trait that successfully ran
+            st.session_state.analysis_mode_ran = st.session_state.analysis_mode 
             
         
         # Display Results if available
-        if st.session_state.results_df is not None:
+        if st.session_state.results_df is not None and st.session_state.trait_ran is not None:
             res_df = st.session_state.results_df
-            perf_trait = st.session_state.perf_trait
+            perf_trait_ran = st.session_state.trait_ran
             
-            st.subheader(f"Results for: {perf_trait}")
+            st.subheader(f"Results for: {perf_trait_ran}")
 
             # --- Point 6: Experiment-Wide Statistics Table ---
             if not st.session_state.stats_df.empty:
@@ -435,6 +451,7 @@ def main():
 
             current_view_df = res_df.copy()
             download_df = res_df.copy()
+            selected_group = "All Combined" # Default for combined or single experiment run
 
             # --- Point 2: Toggling Results for Separate Analysis ---
             if st.session_state.analysis_mode_ran == "Analyze experiments separately" and len(res_df['Analysis_Group'].unique()) > 1:
@@ -451,15 +468,15 @@ def main():
                 st.markdown("**Showing results for:** Combined Analysis")
 
             # Final Display
-            current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait}", ascending=False)
+            current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait_ran}", ascending=False)
             
-            st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait})")
+            st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait_ran})")
             fig = px.bar(
                 current_view_df.head(20),
-                x=f"Predicted_{perf_trait}",
+                x=f"Predicted_{perf_trait_ran}",
                 y=current_view_df.head(20).index,
                 orientation='h',
-                title=f"Top Genotypes: {perf_trait}"
+                title=f"Top Genotypes: {perf_trait_ran}"
             )
             fig.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig, use_container_width=True)
@@ -471,7 +488,7 @@ def main():
             st.download_button(
                 "Download All Combined Results (CSV)", 
                 res_df.to_csv().encode('utf-8'), 
-                f"All_Genotype_BLUPs_{perf_trait}.csv",
+                f"All_Genotype_BLUPs_{perf_trait_ran}.csv",
                 key='dl_all_blups'
             )
             
@@ -479,7 +496,7 @@ def main():
                  st.download_button(
                     f"Download {selected_group} Results Only (CSV)", 
                     download_df.to_csv().encode('utf-8'), 
-                    f"{selected_group}_BLUPs_{perf_trait}.csv",
+                    f"{selected_group}_BLUPs_{perf_trait_ran}.csv",
                     key='dl_single_blup'
                 )
 
@@ -498,7 +515,7 @@ def main():
         else:
             st.header("Parental GCA (General Combining Ability)")
             st.markdown("""
-            **Statistical Rigor:** This module fits a Linear Mixed Model: `Trait ~ (1|Male) + (1|Female) + SpatialCorrection`.
+            **Statistical Rigor:** This module fits a Linear Mixed Model: `Trait ~ FixedEffects(e.g., ExperimentID) + RandomEffects(1|Male) + RandomEffects(1|Female) + SpatialCorrection`.
             This isolates the true genetic breeding value (GCA) of the parents.
             """)
             
