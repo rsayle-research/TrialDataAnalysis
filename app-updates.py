@@ -571,7 +571,7 @@ def main():
                         return ['']*len(row)
                     
                     styled_stats = st.session_state.stats_df.style.apply(color_status, axis=1)
-                    st.dataframe(styled_stats, use_container_width=True, height=None)
+                    st.dataframe(styled_stats, use_container_width=True)
                     
                     # Show any important messages
                     caution_rows = st.session_state.stats_df[st.session_state.stats_df['Status'].str.contains('Caution|Failed', na=False)]
