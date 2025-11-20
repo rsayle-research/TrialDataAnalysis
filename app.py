@@ -7,7 +7,7 @@ import re # Import regex module explicitly
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Canola Breeding Analytics",
+    page_title="Plant Breeding Analytics",
     page_icon="🧬",
     layout="wide"
 )
@@ -116,7 +116,7 @@ def run_stats_model(df, trait, gen_col, row_col, col_col, expt_col):
 # --- MAIN APP ---
 
 def main():
-    st.title("🧬 Gold Standard Plant Breeding Analytics")
+    st.title("🧬Plant Breeding Trial Analytics")
     st.write("Upload your trial CSV. Handles Multi-Environment Trials (MET) and spatial correction.")
 
     # --- SIDEBAR CONFIGURATION ---
