@@ -140,7 +140,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
             debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
             
-            progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
+            progress_bar.progress(
+                min(step_val + 10, 100),
+                text=f"Processing **{run_name}**: Fitting Spatial Model (REML)..."
+            )
+
             
             # Try multiple optimizers for robustness
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
@@ -174,7 +178,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             if result is None:
                 raise Exception("Model fitting failed with all optimizers")
             
-            progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
+            progress_bar.progress(
+                min(step_val + 20, 100),
+                text=f"Processing **{run_name}**: Extracting BLUPs..."
+            )
+
             
             # Extract & Clean Genotype BLUPs
             re_dict = result.random_effects[1]
@@ -199,8 +207,15 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
             # Calculate Experiment-Wide Statistics
-            v_g = result.varmix.get(f"Genotype[C({gen_col})]")
-            v_e = result.scale # Residual variance
+            # variance components returned in same order as vc dict
+            v_g = None
+            try:
+                if hasattr(result, "vcomp") and len(result.vcomp) > 0:
+                    v_g = result.vcomp[0]  # Genotype variance
+            except:
+                v_g = None
+            
+            v_e = result.scale  # residual variance
             
             h2 = 'N/A'
             h2_val = None
