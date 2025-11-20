@@ -97,35 +97,46 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
             
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
+            # Use 'powell' only if 'lbfgs' or 'nm' (default) fail to converge, but sticking to powell for consistency here.
             result = model.fit(method='powell', reml=True) 
             
             # --- STEP 1: LOG SUMMARY ---
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
-            # --- STEP 2: BLUP EXTRACTION (The working part) ---
+            # --- STEP 2: BLUP EXTRACTION (Fix Implemented Here) ---
             if not result.random_effects or 1 not in result.random_effects:
                  raise ValueError("Model failed to estimate random effects (BLUPs).")
 
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
-            re_dict = result.random_effects[1]
-            geno_blups = {}
-            expected_prefix = f"Genotype[C({gen_col})]" 
+            # When using vc_formula, the BLUPs are stored in a Series within the dict, 
+            # keyed by the name used in vc (i.e., 'Genotype').
+            geno_series = result.random_effects[1].get('Genotype')
             
-            for key, val in re_dict.items():
-                if expected_prefix in key:
-                    match = re.search(r'\[([^\[\]]+)\]$', key) 
-                    name = match.group(1) if match and match.group(1) else key
-                    if name.startswith('T.'):
-                        name = name[2:]
-                    geno_blups[name] = val
+            if geno_series is None or not isinstance(geno_series, pd.Series):
+                 # Fallback: Check if the key was slightly different (e.g. if gen_col was 'Hybrid')
+                 # But for simplicity and based on user feedback, we assume 'Genotype' is the key
+                 raise ValueError("Could not find 'Genotype' random effects component for BLUP extraction.")
 
+            # The Series index IS the Genotype name, and the value IS the BLUP
+            geno_blups = geno_series.to_dict() 
+            
             # Create BLUP DataFrame
             temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
             temp_df.index.name = 'Genotype'
             
             # Add Intercept (Fixed Effect Mean)
-            intercept = result.params.get('Intercept', 0)
+            # Find the correct fixed effect mean (Intercept or C(ExptID)[T.Name])
+            intercept = 0
+            if model_data[expt_col].nunique() > 1 and not analyze_separate:
+                # Use the mean of the fixed effects if multiple groups were fit
+                intercept = result.params.filter(regex=f'C\({expt_col}\)').mean()
+                if pd.isna(intercept): # Fall back to Intercept if filtered mean is NA
+                     intercept = result.params.get('Intercept', 0)
+            else:
+                 intercept = result.params.get('Intercept', 0)
+
+
             temp_df[f'Predicted_{trait}'] = temp_df[f'BLUP_{trait}'] + intercept
             temp_df['Analysis_Group'] = run_name
             
@@ -141,11 +152,8 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             try:
                 # --- This block needs to be robust against missing varmix ---
                 
-                # Try the full key first, then fall back to the simple key "Genotype" (the VC name)
-                v_g = result.varmix.get(f"Genotype[C({gen_col})]", None)
-                if v_g is None:
-                     v_g = result.varmix.get("Genotype", None) # Often the key when using vc_formula
-                
+                # The Genotype variance component is typically accessible via the key "Genotype" (the VC name)
+                v_g = result.varmix.get("Genotype", None)
                 v_e = result.scale # Residual variance
                 
                 Ve_val = round(v_e, 3)
@@ -266,24 +274,15 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         
         re_dict = result.random_effects[1]
         
-        male_gca = {}
-        female_gca = {}
-        
-        # --- Extract & Clean GCA Names Robustly ---
-        male_prefix = f"Male_GCA[C({male_col})]"
-        female_prefix = f"Female_GCA[C({female_col})]"
-            
-        for key, val in re_dict.items():
-            match = re.search(r'\[([^\[\]]+)\]$', key) 
-            name = match.group(1) if match and match.group(1) else key
-                
-            if name.startswith('T.'):
-                name = name[2:]
-                
-            if male_prefix in key:
-                male_gca[name] = val
-            elif female_prefix in key:
-                female_gca[name] = val
+        # Use the explicit VC keys
+        male_series = re_dict.get('Male_GCA')
+        female_series = re_dict.get('Female_GCA')
+
+        if male_series is None or female_series is None:
+            raise ValueError("Could not find 'Male_GCA' or 'Female_GCA' random effects components.")
+
+        male_gca = male_series.to_dict()
+        female_gca = female_series.to_dict()
                 
         df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
         df_male.index.name = 'Male Parent'
@@ -602,6 +601,7 @@ def main():
                 if success:
                     st.markdown("""
                     ### GCA Interpretation
+                    
                     
                     * **Positive GCA:** The parent contributes positively to the hybrid's performance. These are the best parents for that trait.
                     * **Negative GCA:** The parent contributes negatively.
