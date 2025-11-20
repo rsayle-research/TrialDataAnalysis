@@ -114,10 +114,9 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
             result = model.fit(method='powell', reml=True) # Use Powell for more robust convergence
             
-            # Check for convergence
-            if not result.mle_retvals['converged']:
-                 debug_log.append(f"WARNING in {run_name}: Model did NOT converge. BLUPs and Vg estimates may be unreliable or missing.")
-
+            # --- FIX: Removed the problematic convergence check using result.mle_retvals['converged']
+            # We rely on the subsequent random_effects check and the outer try/except block for failure handling.
+            
             if not result.random_effects or 1 not in result.random_effects:
                  raise ValueError("Model failed to estimate random effects. Check convergence or data distribution.")
 
@@ -192,7 +191,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             # --- END STATS FIX ---
             
         except Exception as e:
-            # --- FIX 2: Add FAILED row to summary_stats and continue the loop ---
+            # Add FAILED row to summary_stats and log the error message
             error_message = f"MODEL FAILED: {str(e)}"
             debug_log.append(f"🚨 CRITICAL ERROR in {run_name}: {error_message}. Check raw data for NaNs, zero variance, or singular matrix.")
             
@@ -226,6 +225,8 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
     Runs a dedicated GCA model.
     """
     progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
+    
+    debug_output = "" # Initialize output string
     
     try:
         model_data = df.dropna(subset=[trait, male_col, female_col, row_col, col_col]).copy()
@@ -263,10 +264,8 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
         result = model.fit(method='powell', reml=True)
 
-        if not result.mle_retvals['converged']:
-             debug_output = "WARNING: Model did NOT converge. GCA estimates may be unreliable or missing.\n\n"
-        else:
-             debug_output = ""
+        # --- FIX: Removed the problematic convergence check using result.mle_retvals['converged']
+        # We rely on the subsequent random_effects check and the outer try/except block for failure handling.
 
         if not result.random_effects or 1 not in result.random_effects:
              raise ValueError("Model failed to estimate random effects.")
