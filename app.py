@@ -56,7 +56,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
     for i, (run_name, model_data) in enumerate(datasets):
         step_val = int((i / total_runs) * 100)
         
-        # --- Point 2: Dynamic Progress Bar ---
         progress_bar.progress(step_val, text=f"Processing **{run_name}**: Preparing Matrix...")
         
         try:
@@ -90,7 +89,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             }
             random_effects_formula = f"Random Effects: (1|{gen_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
-            # --- Point 4: Model Details in Log ---
             debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
             
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
@@ -100,16 +98,26 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
-            # --- Point 3: Extract & Clean Genotype BLUPs ---
+            # --- FIX: Extract & Clean Genotype BLUPs Robustly ---
             re_dict = result.random_effects[1]
             geno_blups = {}
             
+            # The BLUP keys contain the Genotype factor name, e.g., 'Genotype[C(geno)][Name]'
+            expected_prefix = f"Genotype[C({gen_col})]" 
+            
             for key, val in re_dict.items():
-                if key.startswith("Genotype["):
-                    # Use regex to extract only the genotype name, which is always in the last square brackets
-                    match = re.search(r'\[(.*?)\]$', key)
-                    name = match.group(1) if match else key
+                if expected_prefix in key:
+                    # Robust regex to find the content of the last pair of brackets, which is the actual name
+                    match = re.search(r'\[([^\[\]]+)\]$', key) 
+                    name = match.group(1) if match and match.group(1) else key
+                    
+                    # Clean up the factor notation 'T.' if present
+                    if name.startswith('T.'):
+                        name = name[2:]
+                        
                     geno_blups[name] = val
+            # --- END FIX ---
+
 
             # Create DataFrame
             temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
@@ -123,11 +131,17 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             results_container.append(temp_df)
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
-            # --- Point 6: Calculate Experiment-Wide Statistics ---
-            v_g = result.varmix.get(f"Genotype[C({gen_col})]")
+            # --- FIX: Calculate Experiment-Wide Statistics with Robust Vg Retrieval ---
+            # Try the full key first, then fall back to the simple key "Genotype" (the VC name)
+            v_g = result.varmix.get(f"Genotype[C({gen_col})]", None)
+            if v_g is None:
+                 v_g = result.varmix.get("Genotype", None) # Often the key when using vc_formula
+            
             v_e = result.scale # Residual variance
             
             h2 = 'N/A'
+            Vg_val = round(v_g, 3) if v_g is not None else 'N/A'
+            
             if v_g is not None and v_e is not None and model_data[gen_col].nunique() > 1:
                 # Avg replication estimate based on total plots / total unique genotypes
                 avg_plots_per_geno = model_data.groupby(gen_col).size().mean()
@@ -144,12 +158,13 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                 'Experiment ID': run_name,
                 'Mean': round(mean, 3),
                 'CV (%)': round(cv, 1),
-                'Genotype Var (Vg)': round(v_g, 3) if v_g is not None else 'N/A',
+                'Genotype Var (Vg)': Vg_val, # Use the robustly retrieved Vg value
                 'Residual Var (Ve)': round(v_e, 3),
                 'Est. Heritability (H2, %)': h2,
                 'Plots': len(model_data),
                 'Unique Genotypes': model_data[gen_col].nunique()
             })
+            # --- END FIX ---
             
         except Exception as e:
             debug_log.append(f"ERROR in {run_name}: {str(e)}")
@@ -208,15 +223,24 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         male_gca = {}
         female_gca = {}
         
-        # --- Point 3: Extract & Clean GCA Names ---
-        for key, val in re_dict.items():
-            match = re.search(r'\[(.*?)\]$', key)
-            name = match.group(1) if match else key
+        # --- FIX: Extract & Clean GCA Names Robustly ---
+        male_prefix = f"Male_GCA[C({male_col})]"
+        female_prefix = f"Female_GCA[C({female_col})]"
             
-            if key.startswith("Male_GCA["):
+        for key, val in re_dict.items():
+            # Robust regex to find the content of the last pair of brackets, which is the actual name
+            match = re.search(r'\[([^\[\]]+)\]$', key) 
+            name = match.group(1) if match and match.group(1) else key
+                
+            # Clean up the factor notation 'T.' if present
+            if name.startswith('T.'):
+                name = name[2:]
+                
+            if male_prefix in key:
                 male_gca[name] = val
-            elif key.startswith("Female_GCA["):
+            elif female_prefix in key:
                 female_gca[name] = val
+        # --- END FIX ---
                 
         df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
         df_male.index.name = 'Male Parent'
@@ -446,6 +470,7 @@ def main():
             # --- Point 6: Experiment-Wide Statistics Table ---
             if not st.session_state.stats_df.empty:
                 st.markdown("##### Experiment-Wide Statistical Summary")
+                # This dataframe includes 'Est. Heritability (H2, %)' for each experiment
                 st.dataframe(st.session_state.stats_df, use_container_width=True)
                 st.markdown("---")
 
@@ -468,6 +493,7 @@ def main():
                 st.markdown("**Showing results for:** Combined Analysis")
 
             # Final Display
+            # Note: The index here is the cleaned Genotype name from the BLUP extraction step.
             current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait_ran}", ascending=False)
             
             st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait_ran})")
@@ -530,10 +556,12 @@ def main():
                     c_male, c_fem = st.columns(2)
                     
                     c_male.subheader(f"Male GCA (Trait: {gca_trait})")
+                    # Note: The index here is the cleaned Male Parent name from the GCA extraction step.
                     male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
                     c_male.dataframe(male_df.style.background_gradient(cmap="Blues"), use_container_width=True)
                     
                     c_fem.subheader(f"Female GCA (Trait: {gca_trait})")
+                    # Note: The index here is the cleaned Female Parent name from the GCA extraction step.
                     female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
                     c_fem.dataframe(female_df.style.background_gradient(cmap="Reds"), use_container_width=True)
 
