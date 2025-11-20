@@ -627,17 +627,6 @@ def main():
             # Final Display
             current_view_df = current_view_df.sort_values(by=f"Predicted_{perf_trait_ran}", ascending=False)
             
-            st.markdown(f"##### Top 20 Genotypes (Predicted {perf_trait_ran})")
-            fig = px.bar(
-                current_view_df.head(20),
-                x=f"Predicted_{perf_trait_ran}",
-                y=current_view_df.head(20).index,
-                orientation='h',
-                title=f"Top Genotypes: {perf_trait_ran}"
-            )
-            fig.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig, use_container_width=True)
-            
             st.markdown("##### Full Results Table")
             st.dataframe(current_view_df)
             
