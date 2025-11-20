@@ -16,6 +16,36 @@ st.set_page_config(
 
 # --- HELPER FUNCTIONS ---
 
+def extract_genotype_name(key, prefix="Genotype"):
+    """
+    Extracts clean genotype name from mixed model random effect keys.
+    Handles formats like: "Genotype[C(Hybrid)[HyTTec Velocity]]"
+    Returns: "HyTTec Velocity"
+    """
+    # First, check if this key starts with the expected prefix
+    if not key.startswith(f"{prefix}["):
+        return key
+    
+    # Remove the prefix part
+    key_content = key[len(prefix)+1:]  # Remove "Genotype[" or "Male_GCA[" etc.
+    
+    # Look for pattern "C(column_name)[actual_value]"
+    # This handles the statsmodels categorical variable encoding
+    match = re.search(r'C\([^)]+\)\[([^\]]+)\]', key_content)
+    if match:
+        return match.group(1)
+    
+    # Fallback: just extract content from the outermost brackets
+    if key_content.endswith(']'):
+        key_content = key_content[:-1]
+    
+    # If there's still a bracket structure, get the innermost value
+    inner_match = re.search(r'\[([^\]]+)\]$', key_content)
+    if inner_match:
+        return inner_match.group(1)
+    
+    return key_content
+
 def clean_curveballs(df, traits):
     log = []
     df_clean = df.copy()
@@ -56,7 +86,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
     for i, (run_name, model_data) in enumerate(datasets):
         step_val = int((i / total_runs) * 100)
         
-        # --- Point 2: Dynamic Progress Bar ---
         progress_bar.progress(step_val, text=f"Processing **{run_name}**: Preparing Matrix...")
         
         try:
@@ -90,26 +119,24 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             }
             random_effects_formula = f"Random Effects: (1|{gen_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
-            # --- Point 4: Model Details in Log ---
             debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
             
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
             
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
-            result = model.fit(method='powell', reml=True) # Use Powell for more robust convergence
+            result = model.fit(method='powell', reml=True)
             
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
-            # --- Point 3: Extract & Clean Genotype BLUPs ---
+            # Extract & Clean Genotype BLUPs
             re_dict = result.random_effects[1]
             geno_blups = {}
             
             for key, val in re_dict.items():
                 if key.startswith("Genotype["):
-                    # Use regex to extract only the genotype name, which is always in the last square brackets
-                    match = re.search(r'\[(.*?)\]$', key)
-                    name = match.group(1) if match else key
-                    geno_blups[name] = val
+                    # Use improved extraction function
+                    clean_name = extract_genotype_name(key, "Genotype")
+                    geno_blups[clean_name] = val
 
             # Create DataFrame
             temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
@@ -123,7 +150,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             results_container.append(temp_df)
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
-            # --- Point 6: Calculate Experiment-Wide Statistics ---
+            # Calculate Experiment-Wide Statistics
             v_g = result.varmix.get(f"Genotype[C({gen_col})]")
             v_e = result.scale # Residual variance
             
@@ -208,15 +235,14 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         male_gca = {}
         female_gca = {}
         
-        # --- Point 3: Extract & Clean GCA Names ---
+        # Extract & Clean GCA Names
         for key, val in re_dict.items():
-            match = re.search(r'\[(.*?)\]$', key)
-            name = match.group(1) if match else key
-            
             if key.startswith("Male_GCA["):
-                male_gca[name] = val
+                clean_name = extract_genotype_name(key, "Male_GCA")
+                male_gca[clean_name] = val
             elif key.startswith("Female_GCA["):
-                female_gca[name] = val
+                clean_name = extract_genotype_name(key, "Female_GCA")
+                female_gca[clean_name] = val
                 
         df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
         df_male.index.name = 'Male Parent'
@@ -225,7 +251,7 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         
         progress_bar.empty()
         
-        # --- Point 4: Statistical Output ---
+        # Statistical Output
         debug_output = f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
         debug_output += f"--- GCA Model Summary ---\n{result.summary().as_text()}"
         
@@ -247,7 +273,6 @@ def main():
         st.session_state.debug_log = None
     if 'analysis_mode' not in st.session_state:
         st.session_state.analysis_mode = "Analyze experiments separately"
-    # New state variable to store the trait that successfully ran the analysis (Fixes StreamlitAPIException)
     if 'trait_ran' not in st.session_state:
         st.session_state.trait_ran = None
 
@@ -278,13 +303,12 @@ def main():
         
         all_cols = ["Select Column..."] + df.columns.tolist()
         
-        # --- Point 1: Change label to "Genotype" ---
         col_map['expt'] = st.sidebar.selectbox("Experiment ID", all_cols)
         col_map['geno'] = st.sidebar.selectbox("Genotype", all_cols)
         col_map['row'] = st.sidebar.selectbox("Plot Row", all_cols)
         col_map['col'] = st.sidebar.selectbox("Plot Column", all_cols)
         
-        # --- Point 1: Optional Parent Columns with Info Bubble ---
+        # Optional Parent Columns
         with st.sidebar.expander("GCA Parental Lines (Optional)"):
             st.info("GCA analysis can be performed if parental lines are selected for hybrid crops.")
             col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
@@ -303,7 +327,6 @@ def main():
         unique_expts = df[col_map['expt']].unique().tolist()
         selected_expts = st.sidebar.multiselect("Select Experiments to Include", unique_expts, default=unique_expts)
         
-        # Ensure selected_traits doesn't include the mapped columns that are not 'Select Column...'
         potential_traits = [c for c in df.columns if c not in col_map.values() or c == "Select Column..."]
         selected_traits = st.sidebar.multiselect("Select Phenotypes", potential_traits)
 
@@ -321,7 +344,6 @@ def main():
     df_clean, cleaning_log = clean_curveballs(df_filtered, selected_traits)
 
     # --- TABS ---
-    # --- Point 1: GCA Tab Label based on status ---
     gca_tab_title = f"👨‍👩‍👧 Parental GCA ({'Ready' if gca_enabled else 'Disabled'})"
     tab_qc, tab_spatial, tab_perf, tab_parents = st.tabs([
         "🛡️ QC & Cleaning", 
@@ -348,7 +370,6 @@ def main():
         with c_stats:
             st.markdown(f"**Selected Experiments:** `{len(selected_expts)}`")
             st.markdown(f"**Total Plots:** `{len(df_clean)}`")
-            # --- Point 1: Change to "Genotypes" ---
             st.markdown(f"**Unique Genotypes:** `{df_clean[col_map['geno']].nunique()}`")
         
         with c_missing:
@@ -377,7 +398,6 @@ def main():
     with tab_perf:
         st.header("Genotype Performance Analysis (BLUPs)")
         
-        # --- Point 5: Information Bubble (Enhanced) ---
         with st.expander("Understanding the Statistical Analysis: Fixed vs. Random Effects"):
             st.markdown("""
             The analysis uses a **Linear Mixed Model (LMM)** to calculate **Best Linear Unbiased Predictions (BLUPs)**. This method is the gold standard for separating true genetic merit from field noise. 
@@ -405,10 +425,9 @@ def main():
         col_opts, col_act = st.columns([2, 1])
         perf_trait = col_opts.selectbox("Trait to Analyze", selected_traits, key='perf_trait')
         
-        # Use session state for analysis mode so it persists
         def update_analysis_mode():
             st.session_state.analysis_mode = st.session_state.temp_analysis_mode
-            st.session_state.results_df = None # Clear results when mode changes
+            st.session_state.results_df = None
 
         analysis_mode = col_opts.radio(
             "Analysis Strategy", 
@@ -428,11 +447,10 @@ def main():
             success, res_df, stats_df, debug = run_hybrid_model(
                 df_clean, perf_trait, col_map['geno'], col_map['row'], col_map['col'], col_map['expt'], separate_flag
             )
-            # Store results in session state, using 'trait_ran' to avoid conflict with the 'perf_trait' widget key
             st.session_state.results_df = res_df
             st.session_state.stats_df = stats_df
             st.session_state.debug_log = debug
-            st.session_state.trait_ran = perf_trait # Store the trait that successfully ran
+            st.session_state.trait_ran = perf_trait
             st.session_state.analysis_mode_ran = st.session_state.analysis_mode 
             
         
@@ -443,7 +461,6 @@ def main():
             
             st.subheader(f"Results for: {perf_trait_ran}")
 
-            # --- Point 6: Experiment-Wide Statistics Table ---
             if not st.session_state.stats_df.empty:
                 st.markdown("##### Experiment-Wide Statistical Summary")
                 st.dataframe(st.session_state.stats_df, use_container_width=True)
@@ -451,9 +468,8 @@ def main():
 
             current_view_df = res_df.copy()
             download_df = res_df.copy()
-            selected_group = "All Combined" # Default for combined or single experiment run
+            selected_group = "All Combined"
 
-            # --- Point 2: Toggling Results for Separate Analysis ---
             if st.session_state.analysis_mode_ran == "Analyze experiments separately" and len(res_df['Analysis_Group'].unique()) > 1:
                 unique_groups = ["All Combined"] + res_df['Analysis_Group'].unique().tolist()
                 selected_group = st.selectbox("View Results By Experiment", unique_groups)
@@ -484,7 +500,6 @@ def main():
             st.markdown("##### Full Results Table")
             st.dataframe(current_view_df)
             
-            # --- Point 2: Download Options ---
             st.download_button(
                 "Download All Combined Results (CSV)", 
                 res_df.to_csv().encode('utf-8'), 
@@ -500,14 +515,12 @@ def main():
                     key='dl_single_blup'
                 )
 
-            # --- Point 4: Statistical Output ---
             with st.expander("Complete Statistical Model Output (Debug)"):
                 st.text(st.session_state.debug_log)
 
 
     # --- TAB 4: PARENTAL GCA ---
     with tab_parents:
-        # --- Point 1: Greyed out logic and explanation ---
         if not gca_enabled:
             st.header("Parental GCA (General Combining Ability) Disabled")
             st.error("GCA analysis requires both the 'Male Parent' and 'Female Parent' columns to be selected in the sidebar map.")
