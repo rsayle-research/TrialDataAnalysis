@@ -263,49 +263,49 @@ def main():
             st.success("No statistical anomalies detected.")
 
         col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**Selected Experiments:** {len(selected_expts)}")
-            st.write(f"**Total Plots:** {len(df_clean)}")
-            st.write(f"**Unique Hybrids:** {df_clean[col_map['geno']].nunique()}")
-        with col2:
-            st.write("**Missing Values:**")
-            st.dataframe(df_clean[selected_traits].isnull().sum())
+        
+        # Refactored to explicit calls to prevent DeltaGenerator print error
+        col1.write(f"**Selected Experiments:** {len(selected_expts)}")
+        col1.write(f"**Total Plots:** {len(df_clean)}")
+        col1.write(f"**Unique Hybrids:** {df_clean[col_map['geno']].nunique()}")
+        
+        col2.write("**Missing Values:**")
+        col2.dataframe(df_clean[selected_traits].isnull().sum())
 
     # --- TAB 2: SPATIAL ---
     with tab_spatial:
         st.header("Spatial Field Map")
         c1, c2 = st.columns([1, 3])
-        with c1:
-            map_trait = st.selectbox("View Trait", selected_traits)
-            map_expt = st.selectbox("View Experiment", selected_expts)
-        with c2:
-            map_data = df_clean[df_clean[col_map['expt']] == map_expt]
-            if not map_data.empty:
-                pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
-                fig = px.imshow(pivot, color_continuous_scale='Viridis', title=f"{map_expt}: {map_trait}", aspect="auto")
-                fig.update_yaxes(autorange="reversed")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("No data.")
+        # Refactored to explicit calls
+        map_trait = c1.selectbox("View Trait", selected_traits)
+        map_expt = c1.selectbox("View Experiment", selected_expts)
+        
+        map_data = df_clean[df_clean[col_map['expt']] == map_expt]
+        if not map_data.empty:
+            pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
+            fig = px.imshow(pivot, color_continuous_scale='Viridis', title=f"{map_expt}: {map_trait}", aspect="auto")
+            fig.update_yaxes(autorange="reversed")
+            c2.plotly_chart(fig, use_container_width=True)
+        else:
+            c2.warning("No data.")
 
     # --- TAB 3: GENOTYPE PERFORMANCE ---
     with tab_perf:
         st.header("Hybrid Performance Analysis")
         
         col_opts, col_act = st.columns([2, 1])
-        with col_opts:
-            perf_trait = st.selectbox("Trait to Analyze", selected_traits, key='perf_trait')
-            analysis_mode = st.radio(
-                "Analysis Strategy", 
-                ["Analyze experiments separately", "Analyze all experiments as one group"],
-                help="Separate: Runs a spatial model for each trial loop. Group: Runs one model with Experiment as a fixed effect."
-            )
-            separate_flag = True if analysis_mode == "Analyze experiments separately" else False
+        # Refactored to explicit calls
+        perf_trait = col_opts.selectbox("Trait to Analyze", selected_traits, key='perf_trait')
+        analysis_mode = col_opts.radio(
+            "Analysis Strategy", 
+            ["Analyze experiments separately", "Analyze all experiments as one group"],
+            help="Separate: Runs a spatial model for each trial loop. Group: Runs one model with Experiment as a fixed effect."
+        )
+        separate_flag = True if analysis_mode == "Analyze experiments separately" else False
 
-        with col_act:
-            st.write("") 
-            st.write("") 
-            run_btn = st.button("🚀 Run Hybrid Analysis", type="primary")
+        col_act.write("") 
+        col_act.write("") 
+        run_btn = col_act.button("🚀 Run Hybrid Analysis", type="primary")
 
         if run_btn:
             success, res_df, debug = run_hybrid_model(
@@ -354,15 +354,14 @@ def main():
             if success:
                 c_male, c_fem = st.columns(2)
                 
-                with c_male:
-                    st.subheader("Male GCA (Best to Worst)")
-                    male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
-                    st.dataframe(male_df.style.background_gradient(cmap="Blues"))
+                # Refactored to explicit calls
+                c_male.subheader("Male GCA (Best to Worst)")
+                male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                c_male.dataframe(male_df.style.background_gradient(cmap="Blues"))
                 
-                with c_fem:
-                    st.subheader("Female GCA (Best to Worst)")
-                    female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
-                    st.dataframe(female_df.style.background_gradient(cmap="Reds"))
+                c_fem.subheader("Female GCA (Best to Worst)")
+                female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                c_fem.dataframe(female_df.style.background_gradient(cmap="Reds"))
                     
                 with st.expander("GCA Model Details"):
                     st.text(debug)
