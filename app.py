@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import statsmodels.formula.api as smf
-import re # Import regex module explicitly
+import re
+import time
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -15,25 +16,19 @@ st.set_page_config(
 # --- HELPER FUNCTIONS ---
 
 def validate_data(df):
-    """Checks for critical issues in the dataset structure."""
     if df.empty:
         return False, ["The uploaded file is empty."]
     return True, []
 
 def clean_curveballs(df, traits):
-    """
-    Identifies and cleans statistical anomalies.
-    """
     log = []
     df_clean = df.copy()
     
     for trait in traits:
-        # 1. Force Numeric
         if not pd.api.types.is_numeric_dtype(df_clean[trait]):
             df_clean[trait] = pd.to_numeric(df_clean[trait], errors='coerce')
             log.append(f"⚠️ Column '{trait}' contained non-numeric data. Values converted to NA.")
         
-        # 2. Negative Value Detection
         neg_mask = df_clean[trait] < 0
         neg_count = neg_mask.sum()
         if neg_count > 0:
@@ -42,260 +37,353 @@ def clean_curveballs(df, traits):
             
     return df_clean, log
 
-def run_stats_model(df, trait, gen_col, row_col, col_col, expt_col):
+def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_separate):
     """
-    Runs a Linear Mixed Model (LMM) handling multiple trials.
+    Runs LMM for Hybrid Performance (Genotypes).
     """
-    try:
-        model_data = df.dropna(subset=[trait, gen_col, row_col, col_col, expt_col]).copy()
+    progress_bar = st.progress(0, text="Initializing Model...")
+    
+    results_container = []
+    debug_log = []
+    
+    # Define datasets to iterate over
+    if analyze_separate:
+        # Split dataframe by experiment
+        datasets = [(expt, df[df[expt_col] == expt].copy()) for expt in df[expt_col].unique()]
+        total_runs = len(datasets)
+    else:
+        # Use whole dataframe
+        datasets = [("Combined Analysis", df.copy())]
+        total_runs = 1
+
+    for i, (run_name, model_data) in enumerate(datasets):
+        step_val = int((i / total_runs) * 100)
+        progress_bar.progress(step_val, text=f"Processing {run_name}: Preparing Matrix...")
         
-        # --- CRITICAL: Create Unique Spatial IDs ---
-        # Row 1 in Expt A is NOT the same as Row 1 in Expt B.
+        try:
+            model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
+            
+            # Create Unique Spatial IDs to prevent row overlap between experiments if combined
+            # (Even if separate, this doesn't hurt)
+            model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
+            model_data["Unique_Col"] = model_data[expt_col].astype(str) + "_" + model_data[col_col].astype(str)
+            model_data["Global_Group"] = 1
+
+            # Formula Logic
+            if not analyze_separate and model_data[expt_col].nunique() > 1:
+                # Combined: Add Experiment as Fixed Effect to account for base yield differences
+                formula = f"{trait} ~ C({expt_col})"
+            else:
+                # Separate or Single Trial: Intercept only
+                formula = f"{trait} ~ 1"
+
+            # Variance Components (Random Effects)
+            vc = {
+                "Genotype": f"0 + C({gen_col})",
+                "SpatialRow": f"0 + C(Unique_Row)",
+                "SpatialCol": f"0 + C(Unique_Col)"
+            }
+            
+            progress_bar.progress(step_val + 10, text=f"Processing {run_name}: Fitting Spatial Model (REML)...")
+            
+            model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
+            result = model.fit()
+            
+            progress_bar.progress(step_val + 20, text=f"Processing {run_name}: Extracting BLUPs...")
+            
+            # Extract Genotype BLUPs
+            re_dict = result.random_effects[1]
+            geno_blups = {}
+            
+            for key, val in re_dict.items():
+                if key.startswith("Genotype["):
+                    match = re.search(r"\[C\(" + re.escape(gen_col) + r"\)\]\[(.*?)\]", key)
+                    name = match.group(1) if match else key
+                    geno_blups[name] = val
+
+            # Create DataFrame
+            temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
+            
+            # Add Intercept (Prediction)
+            # Note: In combined analysis, predictions are relative to the reference experiment intercept
+            intercept = result.params['Intercept']
+            temp_df[f'Predicted_{trait}'] = temp_df[f'BLUP_{trait}'] + intercept
+            
+            # Add metadata
+            temp_df['Analysis_Group'] = run_name
+            
+            results_container.append(temp_df)
+            debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
+
+        except Exception as e:
+            debug_log.append(f"ERROR in {run_name}: {str(e)}")
+    
+    progress_bar.progress(100, text="Finalizing Results...")
+    time.sleep(0.5)
+    progress_bar.empty()
+    
+    if results_container:
+        final_df = pd.concat(results_container)
+        return True, final_df, "\n".join(debug_log)
+    else:
+        return False, None, "\n".join(debug_log)
+
+def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
+    """
+    Runs a dedicated GCA model: Yield ~ (1|Male) + (1|Female) + Spatial
+    This is more rigorous than simple means.
+    """
+    progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
+    
+    try:
+        model_data = df.dropna(subset=[trait, male_col, female_col, row_col, col_col]).copy()
+        
+        # Create Unique Spatial IDs
         model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
         model_data["Unique_Col"] = model_data[expt_col].astype(str) + "_" + model_data[col_col].astype(str)
-
-        # Determine Formula
-        n_expts = model_data[expt_col].nunique()
+        model_data["Global_Group"] = 1
         
-        if n_expts > 1:
-            # Multi-Trial: Yield ~ Experiment + (1|Genotype) + (1|UniqueRow) + (1|UniqueCol)
+        # Formula: Fixed effects (Experiment if combined)
+        if model_data[expt_col].nunique() > 1:
             formula = f"{trait} ~ C({expt_col})"
         else:
-            # Single Trial: Yield ~ 1 + (1|Genotype) + (1|Row) + (1|Col)
             formula = f"{trait} ~ 1"
-
-        # Define Random Effects (Variance Components)
+            
+        # Variance Components: Male + Female + Spatial
         vc = {
-            "Genotype": f"0 + C({gen_col})",
+            "Male_GCA": f"0 + C({male_col})",
+            "Female_GCA": f"0 + C({female_col})",
             "SpatialRow": f"0 + C(Unique_Row)",
             "SpatialCol": f"0 + C(Unique_Col)"
         }
-
-        # Fit Model
-        # Group by a constant so random effects are treated globally
-        model_data["Global_Group"] = 1
         
-        model = smf.mixedlm(
-            formula, 
-            model_data, 
-            groups="Global_Group", 
-            vc_formula=vc
-        )
-        
+        progress_bar.progress(50, text="Fitting Parental Model...")
+        model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
         result = model.fit()
         
-        # --- EXTRACT BLUPs ---
-        re_dict = result.random_effects[1] # Get the random effects dict
+        progress_bar.progress(80, text="Extracting GCA Values...")
         
-        geno_blups = {}
+        re_dict = result.random_effects[1]
+        
+        # Extract Male GCA
+        male_gca = {}
+        female_gca = {}
+        
         for key, val in re_dict.items():
-            # Parse Genotype BLUPs
-            if key.startswith("Genotype["):
-                # Format is usually Genotype[C(Name)][GenotypeName]
-                # We split by brackets to extract the inner name
-                match = re.search(r"\[C\(" + re.escape(gen_col) + r"\)\]\[(.*?)\]", key)
-                if match:
-                    name = match.group(1)
-                    geno_blups[name] = val
-                else:
-                    # Fallback if regex fails
-                    geno_blups[key] = val
+            # Males
+            if key.startswith("Male_GCA["):
+                match = re.search(r"\[C\(" + re.escape(male_col) + r"\)\]\[(.*?)\]", key)
+                name = match.group(1) if match else key
+                male_gca[name] = val
+            # Females
+            elif key.startswith("Female_GCA["):
+                match = re.search(r"\[C\(" + re.escape(female_col) + r"\)\]\[(.*?)\]", key)
+                name = match.group(1) if match else key
+                female_gca[name] = val
+                
+        df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
+        df_female = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f'GCA_{trait}'])
         
-        blup_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
-        
-        # Add Intercept (Grand Mean) to make values relatable
-        intercept = result.params['Intercept']
-        blup_df[f'Predicted_{trait}'] = blup_df[f'BLUP_{trait}'] + intercept
-        
-        # Return summary as STRING to avoid Streamlit rendering the object
-        return True, blup_df, str(result.summary())
+        progress_bar.empty()
+        return True, df_male, df_female, result.summary().as_text()
         
     except Exception as e:
-        return False, None, str(e)
+        progress_bar.empty()
+        return False, None, None, str(e)
 
 # --- MAIN APP ---
 
 def main():
-    st.title("🧬Plant Breeding Trial Analytics")
-    st.write("Upload your trial CSV. Handles Multi-Environment Trials (MET) and spatial correction.")
+    st.title("🧬 Plant Breeding Trial Analytics")
+    st.write("Upload your trial CSV. Perform spatial correction and genetic analysis.")
 
-    # --- SIDEBAR CONFIGURATION ---
-    # Consolidate all sidebar elements into one block to prevent 'magic' print errors
+    # --- SIDEBAR ---
     with st.sidebar:
         st.header("1. Upload Data")
         uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
-        
-        # Initialize df to None
         df = None
         
-        if uploaded_file is not None:
+        if uploaded_file:
             try:
                 df = pd.read_csv(uploaded_file)
                 st.success("File Uploaded")
             except Exception as e:
-                st.error(f"Error reading file: {e}")
+                st.error(f"Error: {e}")
                 return
-        
+
+        # --- 2. COLUMN MAPPING (Forced Selection) ---
+        col_map = {}
         if df is not None:
             st.divider()
             st.header("2. Map Columns")
-            all_cols = df.columns.tolist()
+            st.info("Please identify the columns in your file.")
             
-            # Helper to find index
-            def get_idx(options, query):
-                matches = [i for i, x in enumerate(options) if query.lower() in x.lower()]
-                return matches[0] if matches else 0
+            all_cols = ["Select Column..."] + df.columns.tolist()
+            
+            col_map['expt'] = st.selectbox("Experiment ID", all_cols)
+            col_map['geno'] = st.selectbox("Genotype/Hybrid", all_cols)
+            col_map['row'] = st.selectbox("Plot Row", all_cols)
+            col_map['col'] = st.selectbox("Plot Column", all_cols)
+            col_map['male'] = st.selectbox("Male Parent", all_cols)
+            col_map['female'] = st.selectbox("Female Parent", all_cols)
+            
+            # Check if mapping is complete
+            if "Select Column..." in col_map.values():
+                st.warning("⚠️ You must map all columns above to proceed.")
+                return # Stop execution until mapped
 
-            col_expt = st.selectbox("Experiment ID", all_cols, index=get_idx(all_cols, "expt"))
-            col_genotype = st.selectbox("Genotype/Hybrid", all_cols, index=get_idx(all_cols, "name"))
-            col_row = st.selectbox("Plot Row", all_cols, index=get_idx(all_cols, "row"))
-            col_col = st.selectbox("Plot Column", all_cols, index=get_idx(all_cols, "col"))
-            col_male = st.selectbox("Male Parent", all_cols, index=get_idx(all_cols, "male"))
-            col_female = st.selectbox("Female Parent", all_cols, index=get_idx(all_cols, "female"))
-            
             st.divider()
-            st.header("3. Filter Data")
-            unique_expts = df[col_expt].unique().tolist()
-            selected_expts = st.multiselect("Select Experiments", unique_expts, default=unique_expts)
+            st.header("3. Filter & Configure")
+            unique_expts = df[col_map['expt']].unique().tolist()
+            selected_expts = st.multiselect("Select Experiments to Include", unique_expts, default=unique_expts)
             
-            st.divider()
-            st.header("4. Select Traits")
-            # Exclude mapping columns from trait list
-            potential_traits = [c for c in all_cols if c not in [col_row, col_col, col_expt, col_genotype]]
-            selected_traits = st.multiselect("Phenotypes", potential_traits, default=[x for x in potential_traits if "yield" in x.lower()])
+            potential_traits = [c for c in df.columns if c not in col_map.values()]
+            selected_traits = st.multiselect("Select Phenotypes", potential_traits)
 
-    # --- MAIN PAGE LOGIC ---
-    # Exit if data not ready
+    # --- MAIN LOGIC ---
     if df is None:
-        st.info("👈 Waiting for CSV upload in the sidebar.")
+        st.info("👈 Upload a CSV file to begin.")
         return
 
-    if not selected_expts:
-        st.warning("Please select at least one experiment in the sidebar.")
+    if not selected_expts or not selected_traits:
+        st.warning("Please select experiments and traits in the sidebar.")
         return
 
-    if not selected_traits:
-        st.warning("Please select at least one trait in the sidebar.")
-        return
-
-    # Filter DataFrame
-    df_filtered = df[df[col_expt].isin(selected_expts)].copy()
+    # Filter Data
+    df_filtered = df[df[col_map['expt']].isin(selected_expts)].copy()
     df_clean, cleaning_log = clean_curveballs(df_filtered, selected_traits)
 
     # --- TABS ---
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab_qc, tab_spatial, tab_perf, tab_parents = st.tabs([
         "🛡️ QC & Cleaning", 
         "🗺️ Spatial Analysis", 
-        "📊 Genetic Performance", 
-        "👨‍👩‍👧 Combining Ability"
+        "📊 Genotype Performance", 
+        "👨‍👩‍👧 Parental GCA"
     ])
 
     # --- TAB 1: QC ---
-    with tab1:
+    with tab_qc:
         st.header("Data Quality Control")
         if cleaning_log:
             for msg in cleaning_log:
-                if "CRITICAL" in msg:
-                    st.error(msg)
-                else:
-                    st.warning(msg)
-        
+                st.error(msg) if "CRITICAL" in msg else st.warning(msg)
+        else:
+            st.success("No statistical anomalies detected.")
+
         col1, col2 = st.columns(2)
         with col1:
-            st.info(f"Analyzing **{len(selected_expts)}** Experiment(s)")
+            st.write(f"**Selected Experiments:** {len(selected_expts)}")
             st.write(f"**Total Plots:** {len(df_clean)}")
-            st.write(f"**Genotypes:** {df_clean[col_genotype].nunique()}")
+            st.write(f"**Unique Hybrids:** {df_clean[col_map['geno']].nunique()}")
         with col2:
             st.write("**Missing Values:**")
             st.dataframe(df_clean[selected_traits].isnull().sum())
 
     # --- TAB 2: SPATIAL ---
-    with tab2:
+    with tab_spatial:
         st.header("Spatial Field Map")
-        st.markdown("Since plot coordinates overlap between trials, **select one experiment** to view at a time.")
-        
-        col_map_1, col_map_2 = st.columns([1, 3])
-        
-        with col_map_1:
-            trait_to_map = st.selectbox("Trait", selected_traits)
-            expt_to_map = st.selectbox("Select Experiment", selected_expts)
-        
-        with col_map_2:
-            map_df = df_clean[df_clean[col_expt] == expt_to_map]
-            
-            if not map_df.empty:
-                pivot = map_df.pivot_table(index=col_row, columns=col_col, values=trait_to_map)
-                
-                fig = px.imshow(
-                    pivot, 
-                    color_continuous_scale='Viridis',
-                    title=f"{expt_to_map}: {trait_to_map}",
-                    aspect="auto"
-                )
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            map_trait = st.selectbox("View Trait", selected_traits)
+            map_expt = st.selectbox("View Experiment", selected_expts)
+        with c2:
+            map_data = df_clean[df_clean[col_map['expt']] == map_expt]
+            if not map_data.empty:
+                pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
+                fig = px.imshow(pivot, color_continuous_scale='Viridis', title=f"{map_expt}: {map_trait}", aspect="auto")
                 fig.update_yaxes(autorange="reversed")
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.warning("No data found for this selection.")
+                st.warning("No data.")
 
-    # --- TAB 3: BLUPs ---
-    with tab3:
-        st.header("Genotype Performance (BLUPs)")
-        st.markdown("This model accounts for Spatial Variation across **all selected experiments**.")
+    # --- TAB 3: GENOTYPE PERFORMANCE ---
+    with tab_perf:
+        st.header("Hybrid Performance Analysis")
         
-        trait_stats = st.selectbox("Select Trait for Analysis", selected_traits, key='stats_select')
-        
-        if st.button(f"Run Analysis for {trait_stats}"):
-            with st.spinner("Running Multi-Environment Linear Mixed Model..."):
-                success, results_df, debug_info = run_stats_model(
-                    df_clean, trait_stats, col_genotype, col_row, col_col, col_expt
-                )
+        col_opts, col_act = st.columns([2, 1])
+        with col_opts:
+            perf_trait = st.selectbox("Trait to Analyze", selected_traits, key='perf_trait')
+            analysis_mode = st.radio(
+                "Analysis Strategy", 
+                ["Analyze experiments separately", "Analyze all experiments as one group"],
+                help="Separate: Runs a spatial model for each trial loop. Group: Runs one model with Experiment as a fixed effect."
+            )
+            separate_flag = True if analysis_mode == "Analyze experiments separately" else False
+
+        with col_act:
+            st.write("") # Spacer
+            st.write("") 
+            run_btn = st.button("🚀 Run Hybrid Analysis", type="primary")
+
+        if run_btn:
+            success, res_df, debug = run_hybrid_model(
+                df_clean, perf_trait, col_map['geno'], col_map['row'], col_map['col'], col_map['expt'], separate_flag
+            )
+            
+            if success:
+                # Display Top Genotypes
+                st.subheader("Top Performing Hybrids")
                 
-                if success:
-                    st.success("Analysis Complete")
-                    
-                    results_df = results_df.sort_values(by=f'Predicted_{trait_stats}', ascending=False)
-                    
-                    # Graph
-                    top_20 = results_df.head(20)
-                    fig_bar = px.bar(
-                        top_20, 
-                        x=f'Predicted_{trait_stats}',
-                        y=top_20.index,
-                        orientation='h',
-                        title=f"Top 20 Genotypes (Across {len(selected_expts)} Trials)",
-                        color=f'Predicted_{trait_stats}',
-                        color_continuous_scale='Greens'
-                    )
-                    fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-                    st.plotly_chart(fig_bar, use_container_width=True)
-                    
-                    # Table and Download
-                    st.dataframe(results_df)
-                    csv = results_df.to_csv().encode('utf-8')
-                    st.download_button("Download BLUPs CSV", csv, f"BLUPs_{trait_stats}.csv", "text/csv")
-                    
-                    with st.expander("View Model Summary"):
-                        st.text(debug_info) # Converted to string in function
-                else:
-                    st.error("Analysis Failed")
-                    st.error(debug_info)
+                # If separate analysis, maybe show top 5 per group, or just sort by value
+                # Sort by prediction
+                res_df = res_df.sort_values(by=f"Predicted_{perf_trait}", ascending=False)
+                
+                # Visualization
+                fig = px.bar(
+                    res_df.head(20),
+                    x=f"Predicted_{perf_trait}",
+                    y=res_df.head(20).index,
+                    color="Analysis_Group" if separate_flag else None,
+                    orientation='h',
+                    title=f"Top 20 Hybrids ({analysis_mode})"
+                )
+                fig.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Data Table
+                st.dataframe(res_df)
+                st.download_button("Download Results CSV", res_df.to_csv().encode('utf-8'), f"Results_{perf_trait}.csv")
+                
+                with st.expander("Statistical Output (Debug)"):
+                    st.text(debug)
+            else:
+                st.error("Model Failed.")
+                st.text(debug)
 
-    # --- TAB 4: PARENTS ---
-    with tab4:
-        st.header("Parental Analysis")
-        analysis_trait = st.selectbox("Select Trait for Parents", selected_traits, key='parent_select')
+    # --- TAB 4: PARENTAL GCA ---
+    with tab_parents:
+        st.header("Parental GCA (General Combining Ability)")
+        st.markdown("""
+        **Statistical Rigor:** This module does **not** just calculate means. 
+        It fits a Linear Mixed Model: `Trait ~ (1|Male) + (1|Female) + SpatialCorrection`.
+        This isolates the true genetic breeding value (GCA) of the parents.
+        """)
         
-        col_p1, col_p2 = st.columns(2)
+        gca_trait = st.selectbox("Trait for GCA", selected_traits, key='gca_trait')
         
-        with col_p1:
-            st.subheader("Male Performance")
-            male_stats = df_clean.groupby(col_male)[analysis_trait].agg(['mean', 'count']).sort_values('mean', ascending=False)
-            st.dataframe(male_stats) 
-
-        with col_p2:
-            st.subheader("Female Performance")
-            fem_stats = df_clean.groupby(col_female)[analysis_trait].agg(['mean', 'count']).sort_values('mean', ascending=False)
-            st.dataframe(fem_stats)
+        if st.button("Calculate GCA"):
+            success, male_df, female_df, debug = run_parental_model(
+                df_clean, gca_trait, col_map['male'], col_map['female'], col_map['row'], col_map['col'], col_map['expt']
+            )
+            
+            if success:
+                c_male, c_fem = st.columns(2)
+                
+                with c_male:
+                    st.subheader("Male GCA (Best to Worst)")
+                    male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                    st.dataframe(male_df.style.background_gradient(cmap="Blues"))
+                
+                with c_fem:
+                    st.subheader("Female GCA (Best to Worst)")
+                    female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                    st.dataframe(female_df.style.background_gradient(cmap="Reds"))
+                    
+                with st.expander("GCA Model Details"):
+                    st.text(debug)
+            else:
+                st.error("GCA Model Failed")
+                st.text(debug)
 
 if __name__ == "__main__":
     main()
