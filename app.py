@@ -61,9 +61,27 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         try:
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
             
+            # --- FIX 1: Explicitly cast critical columns to string for factor handling in statsmodels ---
+            model_data[gen_col] = model_data[gen_col].astype(str)
+            model_data[row_col] = model_data[row_col].astype(str)
+            model_data[col_col] = model_data[col_col].astype(str)
+            # --- END FIX 1 ---
+
             # Ensure enough data for modeling
             if model_data[gen_col].nunique() < 2:
                  debug_log.append(f"ERROR in {run_name}: Not enough unique genotypes ({model_data[gen_col].nunique()}) to run the model.")
+                 
+                 # Add FAILED row for summary table
+                 summary_stats.append({
+                    'Experiment ID': run_name,
+                    'Mean': model_data[trait].mean() if not model_data.empty else 'N/A',
+                    'CV (%)': 'N/A',
+                    'Genotype Var (Vg)': 'SKIPPED',
+                    'Residual Var (Ve)': 'SKIPPED',
+                    'Est. Heritability (H2, %)': 'SKIPPED',
+                    'Plots': len(model_data),
+                    'Unique Genotypes': model_data[gen_col].nunique()
+                })
                  continue
 
             # Create Unique Spatial IDs
@@ -96,9 +114,16 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
             result = model.fit(method='powell', reml=True) # Use Powell for more robust convergence
             
+            # Check for convergence
+            if not result.mle_retvals['converged']:
+                 debug_log.append(f"WARNING in {run_name}: Model did NOT converge. BLUPs and Vg estimates may be unreliable or missing.")
+
+            if not result.random_effects or 1 not in result.random_effects:
+                 raise ValueError("Model failed to estimate random effects. Check convergence or data distribution.")
+
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
-            # --- FIX: Extract & Clean Genotype BLUPs Robustly ---
+            # --- Extract & Clean Genotype BLUPs Robustly ---
             re_dict = result.random_effects[1]
             geno_blups = {}
             
@@ -116,7 +141,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                         name = name[2:]
                         
                     geno_blups[name] = val
-            # --- END FIX ---
+            # --- END BLUP extraction ---
 
 
             # Create DataFrame
@@ -131,7 +156,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             results_container.append(temp_df)
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
-            # --- FIX: Calculate Experiment-Wide Statistics with Robust Vg Retrieval ---
+            # --- Calculate Experiment-Wide Statistics with Robust Vg Retrieval ---
             # Try the full key first, then fall back to the simple key "Genotype" (the VC name)
             v_g = result.varmix.get(f"Genotype[C({gen_col})]", None)
             if v_g is None:
@@ -164,10 +189,24 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                 'Plots': len(model_data),
                 'Unique Genotypes': model_data[gen_col].nunique()
             })
-            # --- END FIX ---
+            # --- END STATS FIX ---
             
         except Exception as e:
-            debug_log.append(f"ERROR in {run_name}: {str(e)}")
+            # --- FIX 2: Add FAILED row to summary_stats and continue the loop ---
+            error_message = f"MODEL FAILED: {str(e)}"
+            debug_log.append(f"🚨 CRITICAL ERROR in {run_name}: {error_message}. Check raw data for NaNs, zero variance, or singular matrix.")
+            
+            summary_stats.append({
+                'Experiment ID': run_name,
+                'Mean': model_data[trait].mean() if 'model_data' in locals() and not model_data.empty else 'N/A',
+                'CV (%)': 'N/A',
+                'Genotype Var (Vg)': 'FAILED',
+                'Residual Var (Ve)': 'FAILED',
+                'Est. Heritability (H2, %)': 'FAILED',
+                'Plots': len(model_data) if 'model_data' in locals() else 0,
+                'Unique Genotypes': model_data[gen_col].nunique() if 'model_data' in locals() else 0
+            })
+            continue
     
     progress_bar.progress(100, text="Finalizing Results...")
     time.sleep(0.5)
@@ -179,7 +218,8 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         final_df = pd.concat(results_container)
         return True, final_df, stats_df, "\n".join(debug_log)
     else:
-        return False, None, stats_df, "\n".join(debug_log)
+        # If no models ran successfully, return an empty DF for the BLUPs but the (potentially failed) stats_df
+        return False, pd.DataFrame(columns=['Genotype', f'BLUP_{trait}', f'Predicted_{trait}', 'Analysis_Group']), stats_df, "\n".join(debug_log)
 
 def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
     """
@@ -190,6 +230,13 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
     try:
         model_data = df.dropna(subset=[trait, male_col, female_col, row_col, col_col]).copy()
         
+        # --- FIX 1: Explicitly cast critical columns to string for factor handling in statsmodels ---
+        model_data[male_col] = model_data[male_col].astype(str)
+        model_data[female_col] = model_data[female_col].astype(str)
+        model_data[row_col] = model_data[row_col].astype(str)
+        model_data[col_col] = model_data[col_col].astype(str)
+        # --- END FIX 1 ---
+
         # Create Unique Spatial IDs
         model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
         model_data["Unique_Col"] = model_data[expt_col].astype(str) + "_" + model_data[col_col].astype(str)
@@ -215,6 +262,14 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         progress_bar.progress(50, text="Fitting Parental Model...")
         model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
         result = model.fit(method='powell', reml=True)
+
+        if not result.mle_retvals['converged']:
+             debug_output = "WARNING: Model did NOT converge. GCA estimates may be unreliable or missing.\n\n"
+        else:
+             debug_output = ""
+
+        if not result.random_effects or 1 not in result.random_effects:
+             raise ValueError("Model failed to estimate random effects.")
         
         progress_bar.progress(80, text="Extracting GCA Values...")
         
@@ -223,7 +278,7 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         male_gca = {}
         female_gca = {}
         
-        # --- FIX: Extract & Clean GCA Names Robustly ---
+        # --- Extract & Clean GCA Names Robustly ---
         male_prefix = f"Male_GCA[C({male_col})]"
         female_prefix = f"Female_GCA[C({female_col})]"
             
@@ -249,15 +304,15 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         
         progress_bar.empty()
         
-        # --- Point 4: Statistical Output ---
-        debug_output = f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
+        # --- Statistical Output ---
+        debug_output += f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
         debug_output += f"--- GCA Model Summary ---\n{result.summary().as_text()}"
         
         return True, df_male, df_female, debug_output
         
     except Exception as e:
         progress_bar.empty()
-        return False, None, None, str(e)
+        return False, None, None, f"GCA Model Failed Critically: {str(e)}"
 
 # --- MAIN APP ---
 
@@ -310,7 +365,6 @@ def main():
         
         # --- Point 1: Optional Parent Columns with Info Bubble ---
         with st.sidebar.expander("GCA Parental Lines (Optional)"):
-            st.info("GCA analysis can be performed if parental lines are selected for hybrid crops.")
             col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
             col_map['female'] = st.selectbox("Female Parent (Required for GCA)", all_cols)
         
@@ -461,19 +515,23 @@ def main():
             
         
         # Display Results if available
-        if st.session_state.results_df is not None and st.session_state.trait_ran is not None:
+        if st.session_state.stats_df is not None:
+            
+            st.subheader(f"Results for: {st.session_state.trait_ran}")
+
+            # --- Point 6: Experiment-Wide Statistics Table (Guaranteed to show, even with failures) ---
+            if not st.session_state.stats_df.empty:
+                st.markdown("##### Experiment-Wide Statistical Summary")
+                st.dataframe(st.session_state.stats_df, use_container_width=True)
+                st.markdown("---")
+            else:
+                st.warning("No statistical data was generated. Check the Debug Log below.")
+
+
+        if st.session_state.results_df is not None and not st.session_state.results_df.empty:
             res_df = st.session_state.results_df
             perf_trait_ran = st.session_state.trait_ran
             
-            st.subheader(f"Results for: {perf_trait_ran}")
-
-            # --- Point 6: Experiment-Wide Statistics Table ---
-            if not st.session_state.stats_df.empty:
-                st.markdown("##### Experiment-Wide Statistical Summary")
-                # This dataframe includes 'Est. Heritability (H2, %)' for each experiment
-                st.dataframe(st.session_state.stats_df, use_container_width=True)
-                st.markdown("---")
-
             current_view_df = res_df.copy()
             download_df = res_df.copy()
             selected_group = "All Combined" # Default for combined or single experiment run
@@ -526,9 +584,15 @@ def main():
                     key='dl_single_blup'
                 )
 
-            # --- Point 4: Statistical Output ---
-            with st.expander("Complete Statistical Model Output (Debug)"):
+        else:
+             st.error("Model results table is empty. Check the 'Experiment-Wide Statistical Summary' above for 'FAILED' entries and review the Complete Statistical Model Output below for error messages.")
+
+
+        # --- Point 4: Statistical Output (Always display if generated) ---
+        if st.session_state.debug_log:
+             with st.expander("Complete Statistical Model Output (Debug)"):
                 st.text(st.session_state.debug_log)
+        
 
 
     # --- TAB 4: PARENTAL GCA ---
@@ -581,8 +645,9 @@ def main():
                     with st.expander("Complete GCA Model Output (Debug)"):
                         st.text(debug)
                 else:
-                    st.error("GCA Model Failed")
-                    st.text(debug)
+                    st.error("GCA Model Failed. Check the debug output.")
+                    with st.expander("Complete GCA Model Output (Debug)"):
+                        st.text(debug)
 
 if __name__ == "__main__":
     main()
