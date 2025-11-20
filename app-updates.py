@@ -88,12 +88,31 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         
         progress_bar.progress(step_val, text=f"Processing **{run_name}**: Preparing Matrix...")
         
+        # Initialize status tracking
+        convergence_status = "❌ Failed"
+        convergence_message = ""
+        optimizer_used = "None"
+        
         try:
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
             
             # Ensure enough data for modeling
             if model_data[gen_col].nunique() < 2:
                  debug_log.append(f"ERROR in {run_name}: Not enough unique genotypes ({model_data[gen_col].nunique()}) to run the model.")
+                 convergence_message = f"Only {model_data[gen_col].nunique()} unique genotype(s). Need at least 2."
+                 summary_stats.append({
+                     'Experiment ID': run_name,
+                     'Status': convergence_status,
+                     'Message': convergence_message,
+                     'Optimizer': optimizer_used,
+                     'Mean': 'N/A',
+                     'CV (%)': 'N/A',
+                     'Genotype Var (Vg)': 'N/A',
+                     'Residual Var (Ve)': 'N/A',
+                     'Est. Heritability (H2, %)': 'N/A',
+                     'Plots': len(model_data),
+                     'Unique Genotypes': model_data[gen_col].nunique()
+                 })
                  continue
 
             # Create Unique Spatial IDs
@@ -123,8 +142,37 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             
             progress_bar.progress(step_val + 10, text=f"Processing **{run_name}**: Fitting Spatial Model (REML)...")
             
+            # Try multiple optimizers for robustness
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
-            result = model.fit(method='powell', reml=True)
+            result = None
+            optimizers = ['powell', 'lbfgs', 'bfgs']
+            
+            for opt in optimizers:
+                try:
+                    result = model.fit(method=opt, reml=True)
+                    optimizer_used = opt
+                    # Check if convergence was successful
+                    if hasattr(result, 'converged'):
+                        if result.converged:
+                            convergence_status = "✓ Good"
+                            convergence_message = "Model converged successfully"
+                            break
+                        else:
+                            convergence_status = "⚠️ Caution"
+                            convergence_message = "Weak convergence - results may be less reliable"
+                    else:
+                        # If no converged attribute, assume success if no error
+                        convergence_status = "✓ Good"
+                        convergence_message = "Model fitted successfully"
+                        break
+                except Exception as opt_error:
+                    debug_log.append(f"Optimizer {opt} failed for {run_name}: {str(opt_error)}")
+                    if opt == optimizers[-1]:  # Last optimizer failed
+                        raise Exception(f"All optimizers failed. Last error: {str(opt_error)}")
+                    continue
+            
+            if result is None:
+                raise Exception("Model fitting failed with all optimizers")
             
             progress_bar.progress(step_val + 20, text=f"Processing **{run_name}**: Extracting BLUPs...")
             
@@ -155,13 +203,32 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             v_e = result.scale # Residual variance
             
             h2 = 'N/A'
-            if v_g is not None and v_e is not None and model_data[gen_col].nunique() > 1:
+            h2_val = None
+            
+            # Check for problematic variance components
+            if v_g is None or v_g <= 0:
+                convergence_status = "⚠️ Caution"
+                if v_g is None:
+                    convergence_message = "Genetic variance could not be estimated"
+                else:
+                    convergence_message = "No genetic variation detected (Vg ≤ 0)"
+                h2 = 'N/A'
+            elif v_e is not None and model_data[gen_col].nunique() > 1:
                 # Avg replication estimate based on total plots / total unique genotypes
                 avg_plots_per_geno = model_data.groupby(gen_col).size().mean()
                 
                 # Formula: H^2 = Vg / ( Vg + Ve / n_plots)
                 h2_val = v_g / (v_g + (v_e / avg_plots_per_geno))
                 h2 = round(h2_val * 100, 1)
+                
+                # Update status based on heritability
+                if convergence_status == "✓ Good":
+                    if h2_val < 0.10:  # Less than 10%
+                        convergence_status = "⚠️ Caution"
+                        convergence_message = f"Low heritability ({h2}%) - weak genetic signal"
+                    elif h2_val > 0.95:  # Greater than 95%
+                        convergence_status = "⚠️ Caution"
+                        convergence_message = f"Unusually high heritability ({h2}%) - check data quality"
 
             mean = model_data[trait].mean()
             std_dev = model_data[trait].std()
@@ -169,17 +236,43 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             
             summary_stats.append({
                 'Experiment ID': run_name,
+                'Status': convergence_status,
+                'Message': convergence_message,
+                'Optimizer': optimizer_used,
                 'Mean': round(mean, 3),
                 'CV (%)': round(cv, 1),
-                'Genotype Var (Vg)': round(v_g, 3) if v_g is not None else 'N/A',
-                'Residual Var (Ve)': round(v_e, 3),
+                'Genotype Var (Vg)': round(v_g, 3) if v_g is not None and v_g > 0 else 'N/A',
+                'Residual Var (Ve)': round(v_e, 3) if v_e is not None else 'N/A',
                 'Est. Heritability (H2, %)': h2,
                 'Plots': len(model_data),
                 'Unique Genotypes': model_data[gen_col].nunique()
             })
             
         except Exception as e:
-            debug_log.append(f"ERROR in {run_name}: {str(e)}")
+            error_msg = str(e)
+            # Make error messages more user-friendly
+            if "singular" in error_msg.lower():
+                user_msg = "Not enough variation in data or insufficient replication"
+            elif "convergence" in error_msg.lower():
+                user_msg = "Model couldn't find a stable solution"
+            else:
+                user_msg = error_msg[:100]  # Truncate long errors
+                
+            debug_log.append(f"ERROR in {run_name}: {error_msg}")
+            
+            summary_stats.append({
+                'Experiment ID': run_name,
+                'Status': "❌ Failed",
+                'Message': user_msg,
+                'Optimizer': optimizer_used if 'optimizer_used' in locals() else 'None',
+                'Mean': 'N/A',
+                'CV (%)': 'N/A',
+                'Genotype Var (Vg)': 'N/A',
+                'Residual Var (Ve)': 'N/A',
+                'Est. Heritability (H2, %)': 'N/A',
+                'Plots': len(model_data) if 'model_data' in locals() else 0,
+                'Unique Genotypes': model_data[gen_col].nunique() if 'model_data' in locals() else 0
+            })
     
     progress_bar.progress(100, text="Finalizing Results...")
     time.sleep(0.5)
@@ -461,10 +554,43 @@ def main():
             
             st.subheader(f"Results for: {perf_trait_ran}")
 
-            if not st.session_state.stats_df.empty:
-                st.markdown("##### Experiment-Wide Statistical Summary")
-                st.dataframe(st.session_state.stats_df, use_container_width=True)
+            # --- STATS TABLE - Now more prominent ---
+            if st.session_state.stats_df is not None and not st.session_state.stats_df.empty:
                 st.markdown("---")
+                with st.container():
+                    st.markdown("### 📊 Experiment Analysis Summary")
+                    
+                    # Color-code the dataframe based on status
+                    def color_status(row):
+                        if row['Status'] == '✓ Good':
+                            return ['background-color: #d4edda']*len(row)
+                        elif row['Status'] == '⚠️ Caution':
+                            return ['background-color: #fff3cd']*len(row)
+                        elif row['Status'] == '❌ Failed':
+                            return ['background-color: #f8d7da']*len(row)
+                        return ['']*len(row)
+                    
+                    styled_stats = st.session_state.stats_df.style.apply(color_status, axis=1)
+                    st.dataframe(styled_stats, use_container_width=True, height=None)
+                    
+                    # Show any important messages
+                    caution_rows = st.session_state.stats_df[st.session_state.stats_df['Status'].str.contains('Caution|Failed', na=False)]
+                    if not caution_rows.empty:
+                        with st.expander("ℹ️ What do these status messages mean?", expanded=False):
+                            for _, row in caution_rows.iterrows():
+                                if row['Status'] == '⚠️ Caution':
+                                    st.warning(f"**{row['Experiment ID']}**: {row['Message']}")
+                                    if 'Low heritability' in row['Message']:
+                                        st.caption("💡 Low heritability means genotypes performed similarly or environmental variation was high. Use results cautiously and consider increasing replication.")
+                                    elif 'genetic variation' in row['Message']:
+                                        st.caption("💡 This usually means genotypes are too similar genetically, or field noise is masking genetic differences.")
+                                elif row['Status'] == '❌ Failed':
+                                    st.error(f"**{row['Experiment ID']}**: {row['Message']}")
+                                    st.caption("💡 Try: (1) Check for data entry errors, (2) Ensure minimum 2 reps per genotype, (3) Remove experiments with very few plots (<20)")
+                
+                st.markdown("---")
+            else:
+                st.info("No analysis results yet. Click 'Run Genotype Analysis' above to begin.")
 
             current_view_df = res_df.copy()
             download_df = res_df.copy()
