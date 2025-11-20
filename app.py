@@ -257,8 +257,13 @@ def main():
     with tab_qc:
         st.header("Data Quality Control")
         if cleaning_log:
+            # FIX: Changed single-line conditional print to explicit if/else
+            # to prevent DeltaGenerator object from being implicitly returned/printed.
             for msg in cleaning_log:
-                st.error(msg) if "CRITICAL" in msg else st.warning(msg)
+                if "CRITICAL" in msg:
+                    st.error(msg)
+                else:
+                    st.warning(msg)
         else:
             st.success("No statistical anomalies detected.")
         
@@ -271,16 +276,20 @@ def main():
         
         st.subheader("Missing Values Count per Trait")
         st.dataframe(df_clean[selected_traits].isnull().sum())
+        
+        # Defensive element to capture any accidental returns
+        st.empty() 
 
     # --- TAB 2: SPATIAL ---
     with tab_spatial:
         st.header("Spatial Field Map")
         c1, c2 = st.columns([1, 3])
         # Refactored to explicit calls
-        map_trait = c1.selectbox("View Trait", selected_traits)
-        map_expt = c1.selectbox("View Experiment", selected_expts)
+        map_trait = c1.selectbox("View Trait", selected_traits, key='map_trait')
+        map_expt = c1.selectbox("View Experiment", selected_expts, key='map_expt')
         
-        map_data = df_clean[df[col_map['expt']] == map_expt]
+        # FIX: Ensure we filter the cleaned dataframe against itself (using df_clean for both sides of the condition)
+        map_data = df_clean[df_clean[col_map['expt']] == map_expt]
         if not map_data.empty:
             pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
             fig = px.imshow(pivot, color_continuous_scale='Viridis', title=f"{map_expt}: {map_trait}", aspect="auto")
