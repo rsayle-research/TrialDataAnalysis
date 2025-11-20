@@ -253,7 +253,7 @@ def main():
         "👨‍👩‍👧 Parental GCA"
     ])
 
-    # --- TAB 1: QC ---
+    # --- TAB 1: QC (SIMPLIFIED LAYOUT) ---
     with tab_qc:
         st.header("Data Quality Control")
         if cleaning_log:
@@ -261,16 +261,16 @@ def main():
                 st.error(msg) if "CRITICAL" in msg else st.warning(msg)
         else:
             st.success("No statistical anomalies detected.")
-
-        col1, col2 = st.columns(2)
         
-        # Refactored to explicit calls to prevent DeltaGenerator print error
-        col1.write(f"**Selected Experiments:** {len(selected_expts)}")
-        col1.write(f"**Total Plots:** {len(df_clean)}")
-        col1.write(f"**Unique Hybrids:** {df_clean[col_map['geno']].nunique()}")
+        # Removed st.columns(2) to resolve persistent DeltaGenerator printing issue.
+        # Layout is now vertical.
+        st.subheader("Summary Statistics")
+        st.markdown(f"**Selected Experiments:** `{len(selected_expts)}`")
+        st.markdown(f"**Total Plots:** `{len(df_clean)}`")
+        st.markdown(f"**Unique Hybrids:** `{df_clean[col_map['geno']].nunique()}`")
         
-        col2.write("**Missing Values:**")
-        col2.dataframe(df_clean[selected_traits].isnull().sum())
+        st.subheader("Missing Values Count per Trait")
+        st.dataframe(df_clean[selected_traits].isnull().sum())
 
     # --- TAB 2: SPATIAL ---
     with tab_spatial:
@@ -280,7 +280,7 @@ def main():
         map_trait = c1.selectbox("View Trait", selected_traits)
         map_expt = c1.selectbox("View Experiment", selected_expts)
         
-        map_data = df_clean[df_clean[col_map['expt']] == map_expt]
+        map_data = df_clean[df[col_map['expt']] == map_expt]
         if not map_data.empty:
             pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
             fig = px.imshow(pivot, color_continuous_scale='Viridis', title=f"{map_expt}: {map_trait}", aspect="auto")
