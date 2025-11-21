@@ -303,71 +303,105 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
 def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
     """
-    Runs a dedicated GCA model.
+    NEW IMPLEMENTATION:
+    Runs the GCA model **separately for each selected experiment**.
+    Returns combined per-experiment GCA values for Male & Female parents.
+    Adds a new column 'Group' indicating the experiment name.
     """
-    progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
-    
-    try:
-        model_data = df.dropna(subset=[trait, male_col, female_col, row_col, col_col]).copy()
+
+    progress_bar = st.progress(0, text="Initializing GCA Analysis...")
+
+    male_results = []
+    female_results = []
+    debug_log = []
+
+    expts = df[expt_col].unique().tolist()
+    total = len(expts)
+
+    for i, expt in enumerate(expts):
+        progress_bar.progress(int((i / total) * 100), text=f"Running GCA for {expt}...")
         
-        # Create Unique Spatial IDs
-        model_data["Unique_Row"] = model_data[expt_col].astype(str) + "_" + model_data[row_col].astype(str)
-        model_data["Unique_Col"] = model_data[expt_col].astype(str) + "_" + model_data[col_col].astype(str)
-        model_data["Global_Group"] = 1
-        
-        # Formula
-        if model_data[expt_col].nunique() > 1:
-            formula = f"{trait} ~ C({expt_col})"
-            fixed_effects_formula = f"Fixed Effects: {trait} ~ C({expt_col})"
-        else:
-            formula = f"{trait} ~ 1"
-            fixed_effects_formula = f"Fixed Effects: {trait} ~ Intercept"
-            
-        # Variance Components
+        data_expt = df[df[expt_col] == expt].dropna(
+            subset=[trait, male_col, female_col, row_col, col_col]
+        ).copy()
+
+        # Skip empty or invalid datasets
+        if data_expt.empty:
+            debug_log.append(f"[{expt}] Skipped: No valid rows.")
+            continue
+
+        # Build spatial ID columns
+        data_expt["Unique_Row"] = data_expt[row_col].astype(str)
+        data_expt["Unique_Col"] = data_expt[col_col].astype(str)
+        data_expt["Global_Group"] = 1
+
+        # Fixed Effects — since running per experiment, only intercept is used
+        formula = f"{trait} ~ 1"
+
+        # Random Effects
         vc = {
             "Male_GCA": f"0 + C({male_col})",
             "Female_GCA": f"0 + C({female_col})",
-            "SpatialRow": f"0 + C(Unique_Row)",
-            "SpatialCol": f"0 + C(Unique_Col)"
+            "SpatialRow": "0 + C(Unique_Row)",
+            "SpatialCol": "0 + C(Unique_Col)"
         }
-        random_effects_formula = f"Random Effects: (1|{male_col}) + (1|{female_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
-        progress_bar.progress(50, text="Fitting Parental Model...")
-        model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
-        result = model.fit(method='powell', reml=True)
-        
-        progress_bar.progress(80, text="Extracting GCA Values...")
-        
-        re_dict = result.random_effects[1]
-        
-        male_gca = {}
-        female_gca = {}
-        
-        # Extract & Clean GCA Names
-        for key, val in re_dict.items():
-            if key.startswith("Male_GCA["):
-                clean_name = extract_genotype_name(key, "Male_GCA")
-                male_gca[clean_name] = val
-            elif key.startswith("Female_GCA["):
-                clean_name = extract_genotype_name(key, "Female_GCA")
-                female_gca[clean_name] = val
-                
-        df_male = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
-        df_male.index.name = 'Male Parent'
-        df_female = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f'GCA_{trait}'])
-        df_female.index.name = 'Female Parent'
-        
-        progress_bar.empty()
-        
-        # Statistical Output
-        debug_output = f"--- GCA Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}\n\n"
-        debug_output += f"--- GCA Model Summary ---\n{result.summary().as_text()}"
-        
-        return True, df_male, df_female, debug_output
-        
-    except Exception as e:
-        progress_bar.empty()
-        return False, None, None, str(e)
+        # Fit model
+        try:
+            model = smf.mixedlm(formula, data_expt, groups="Global_Group", vc_formula=vc)
+            result = model.fit(method='powell', reml=True)
+
+            re_dict = result.random_effects[1]
+
+            # Extract GCA values
+            male_gca = {}
+            female_gca = {}
+
+            for key, val in re_dict.items():
+                if key.startswith("Male_GCA["):
+                    name = extract_genotype_name(key, "Male_GCA")
+                    male_gca[name] = val
+                elif key.startswith("Female_GCA["):
+                    name = extract_genotype_name(key, "Female_GCA")
+                    female_gca[name] = val
+
+            # Convert to DataFrames & add group column
+            df_m = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f"GCA_{trait}"])
+            df_m.index.name = 'Male Parent'
+            df_m["Group"] = expt
+            male_results.append(df_m)
+
+            df_f = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f"GCA_{trait}"])
+            df_f.index.name = 'Female Parent'
+            df_f["Group"] = expt
+            female_results.append(df_f)
+
+            debug_log.append(
+                f"\n--- GCA Model Summary ({expt}) ---\n{result.summary().as_text()}\n"
+            )
+
+        except Exception as e:
+            debug_log.append(f"[{expt}] Error: {str(e)}")
+
+    progress_bar.progress(100, text="Finalizing GCA Results...")
+    progress_bar.empty()
+
+    # Combine across experiments
+    if male_results:
+        male_final = pd.concat(male_results)
+    else:
+        male_final = None
+
+    if female_results:
+        female_final = pd.concat(female_results)
+    else:
+        female_final = None
+
+    # Return
+    if male_final is None or female_final is None:
+        return False, male_final, female_final, "\n".join(debug_log)
+
+    return True, male_final, female_final, "\n".join(debug_log)
 
 # --- MAIN APP ---
 
