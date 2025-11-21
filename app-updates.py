@@ -16,9 +16,7 @@ st.set_page_config(
 # --- HELPER FUNCTIONS ---
 
 def extract_genotype_name(key, prefix="Genotype"):
-    """
-    Extracts clean genotype name from mixed model random effect keys.
-    """
+    """Extracts clean genotype name from mixed model random effect keys."""
     if not key.startswith(f"{prefix}["):
         return key
     key_content = key[len(prefix)+1:]
@@ -71,7 +69,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
             
             # --- CALC RAW STATS (Confidence) ---
-            # Calculate N and SE before modeling to attach to results
             grp_stats = model_data.groupby(gen_col)[trait].agg(['count', 'sem'])
             grp_stats.columns = ['N_Plots', 'Raw_SE']
 
@@ -146,7 +143,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             
             # JOIN STATS
             temp_df = temp_df.join(grp_stats, how='left')
-            
             temp_df['Analysis_Group'] = run_name
 
             results_container.append(temp_df)
@@ -449,13 +445,13 @@ def main():
             if st.session_state.stats_df is not None:
                 st.markdown("### 📋 Experiment Analysis Summary")
                 
-                # Function to color code status
+                # Color Status Rows
                 def color_status_rows(row):
                     color = ''
                     if 'Good' in row['Status']:
                         color = 'background-color: #d4edda; color: #155724' # Green
                     elif 'Caution' in row['Status']:
-                        color = 'background-color: #fff3cd; color: #856404' # Yellow/Orange
+                        color = 'background-color: #fff3cd; color: #856404' # Yellow
                     elif 'Failed' in row['Status']:
                         color = 'background-color: #f8d7da; color: #721c24' # Red
                     return [color] * len(row)
@@ -463,7 +459,6 @@ def main():
                 stats_styled = st.session_state.stats_df.style.apply(color_status_rows, axis=1)
                 st.dataframe(stats_styled, use_container_width=True, hide_index=True)
                 
-                # Dedicated Download Button for Summary (Fixes Issue 4)
                 st.download_button(
                     "Download Summary Table (CSV)",
                     st.session_state.stats_df.to_csv(index=False).encode('utf-8'),
@@ -474,27 +469,30 @@ def main():
             # --- 2. GENOTYPE RESULTS TABLE ---
             st.markdown("### 🏆 Genotype Rankings")
             
-            # Sort by Predicted Value
-            current_view = res_df.sort_values(by=f"Predicted_{trait_ran}", ascending=False)
+            # Fix for KeyError: Reset index so Genotype becomes a column and Index is unique (0,1,2...)
+            current_view = res_df.sort_values(by=f"Predicted_{trait_ran}", ascending=False).reset_index()
+            
+            # Round data for clean CSV download
+            current_view_clean = current_view.round(3)
             
             # Apply Gradient Coloring (Heatmap)
-            # Target columns: BLUP_{trait} and Predicted_{trait}
             cols_to_color = [f'BLUP_{trait_ran}', f'Predicted_{trait_ran}']
             
-            styled_results = current_view.style.background_gradient(
+            # Style with strict formatting
+            styled_results = current_view_clean.style.background_gradient(
                 subset=cols_to_color, 
                 cmap="Blues"
-            ).format({
-                f'BLUP_{trait_ran}': "{:.3f}",
-                f'Predicted_{trait_ran}': "{:.3f}",
-                'Raw_SE': "{:.3f}"
-            })
+            ).format(precision=2)
             
             st.dataframe(styled_results, use_container_width=True, hide_index=True)
             
-            st.download_button("Download Genotype Results (CSV)", res_df.to_csv().encode('utf-8'), f"Genotype_Results_{trait_ran}.csv")
+            st.download_button(
+                "Download Genotype Results (CSV)", 
+                current_view_clean.to_csv(index=False).encode('utf-8'), 
+                f"Genotype_Results_{trait_ran}.csv"
+            )
 
-            # --- 3. MODEL OUTPUT DROPDOWN (Req 1) ---
+            # --- 3. MODEL OUTPUT DROPDOWN ---
             with st.expander("Model Outputs & Logs (Detailed Stats)"):
                 st.text(st.session_state.debug_log)
 
@@ -533,31 +531,43 @@ def main():
                 st.caption(f"Showing results for: **{st.session_state.gca_trait_ran}**")
                 col_m, col_f = st.columns(2)
                 
-                with col_m:
-                    st.subheader("Male Parent Results")
-                    if st.session_state.gca_male_df is not None:
-                        m_df = st.session_state.gca_male_df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
-                        m_df['Raw_SE'] = m_df['Raw_SE'].round(2)
+                # Helper for GCA tables
+                def display_gca_table(df, title, color_map, dl_name):
+                    st.subheader(title)
+                    if df is not None:
+                        # Sort and Round
+                        df_sorted = df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
+                        df_clean = df_sorted.round(3)
+                        
                         st.dataframe(
-                            m_df.style.background_gradient(subset=[f"GCA_{st.session_state.gca_trait_ran}"], cmap="Blues"), 
-                            use_container_width=True, hide_index=True 
+                            df_clean.style.background_gradient(
+                                subset=[f"GCA_{st.session_state.gca_trait_ran}"], 
+                                cmap=color_map
+                            ).format(precision=2), 
+                            use_container_width=True, 
+                            hide_index=True 
                         )
-                        st.download_button(f"Download Male GCA (CSV)", m_df.to_csv(index=False).encode('utf-8'), f"Male_GCA_{st.session_state.gca_trait_ran}.csv", key='dl_male_gca')
+                        st.download_button(f"Download CSV", df_clean.to_csv(index=False).encode('utf-8'), dl_name)
                     else:
-                        st.info("No Male GCA calculated.")
+                        st.info("No results calculated.")
+
+                with col_m:
+                    display_gca_table(
+                        st.session_state.gca_male_df, 
+                        "Male Parent Results", 
+                        "Blues", 
+                        f"Male_GCA_{st.session_state.gca_trait_ran}.csv"
+                    )
 
                 with col_f:
-                    st.subheader("Female Parent Results")
-                    if st.session_state.gca_female_df is not None:
-                        f_df = st.session_state.gca_female_df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
-                        f_df['Raw_SE'] = f_df['Raw_SE'].round(2)
-                        st.dataframe(
-                            f_df.style.background_gradient(subset=[f"GCA_{st.session_state.gca_trait_ran}"], cmap="Reds"), 
-                            use_container_width=True, hide_index=True
-                        )
-                        st.download_button(f"Download Female GCA (CSV)", f_df.to_csv(index=False).encode('utf-8'), f"Female_GCA_{st.session_state.gca_trait_ran}.csv", key='dl_female_gca')
+                    display_gca_table(
+                        st.session_state.gca_female_df, 
+                        "Female Parent Results", 
+                        "Reds", 
+                        f"Female_GCA_{st.session_state.gca_trait_ran}.csv"
+                    )
 
-                # --- MODEL OUTPUT DROPDOWN (Req 1) ---
+                # --- MODEL OUTPUT DROPDOWN ---
                 with st.expander("Model Outputs & Logs (Detailed Stats)"):
                     st.text(st.session_state.gca_debug)
 
