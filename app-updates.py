@@ -70,6 +70,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         try:
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
             
+            # --- CALC RAW STATS (Confidence) ---
+            # Calculate N and SE before modeling to attach to results
+            grp_stats = model_data.groupby(gen_col)[trait].agg(['count', 'sem'])
+            grp_stats.columns = ['N_Plots', 'Raw_SE']
+
             if model_data[gen_col].nunique() < 2:
                  debug_log.append(f"ERROR in {run_name}: Not enough unique genotypes.")
                  convergence_message = f"Only {model_data[gen_col].nunique()} unique genotype(s)."
@@ -138,10 +143,14 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             temp_df.index.name = 'Genotype'
             intercept = result.params.get('Intercept', 0)
             temp_df[f'Predicted_{trait}'] = temp_df[f'BLUP_{trait}'] + intercept
+            
+            # JOIN STATS
+            temp_df = temp_df.join(grp_stats, how='left')
+            
             temp_df['Analysis_Group'] = run_name
 
             results_container.append(temp_df)
-            debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
+            debug_log.append(f"\n{'='*30}\nMODEL OUTPUT: {run_name}\n{'='*30}\n{result.summary().as_text()}")
 
             # Stats extraction
             v_g = result.vcomp[0] if (hasattr(result, "vcomp") and len(result.vcomp) > 0) else None
@@ -180,7 +189,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         except Exception as e:
             error_msg = str(e)
             user_msg = "Not enough variation or singular matrix" if "singular" in error_msg.lower() else error_msg[:100]
-            debug_log.append(f"ERROR in {run_name}: {error_msg}")
+            debug_log.append(f"\n{'='*30}\nERROR: {run_name}\n{'='*30}\n{error_msg}")
             summary_stats.append({
                 'Experiment ID': run_name, 'Status': "❌ Failed", 'Message': user_msg,
                 'Optimizer': optimizer_used, 'Mean': 'N/A', 'CV (%)': 'N/A', 'Genotype Var (Vg)': 'N/A',
@@ -200,9 +209,6 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
         return False, None, stats_df, "\n".join(debug_log)
 
 def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
-    """
-    Updated to include Progeny Counts and Raw Standard Error (proxy for confidence).
-    """
     progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
     male_results = []
     female_results = []
@@ -218,10 +224,6 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
             debug_messages.append(f"[{expt}] Skipped: no valid rows.")
             continue
 
-        # --- 1. Calculate Raw Stats (Count & SE) before modeling ---
-        # This provides the 'Confidence' metrics user requested
-        
-        # Helper to get count and SE
         def get_stats(data, group_col, value_col):
             stats = data.groupby(group_col)[value_col].agg(['count', 'sem'])
             stats.columns = ['N_Progeny', 'Raw_SE']
@@ -230,7 +232,6 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
         male_stats = get_stats(expt_data, male_col, trait)
         female_stats = get_stats(expt_data, female_col, trait)
 
-        # --- 2. Setup Model ---
         expt_data["Unique_Row"] = expt_data[row_col].astype(str)
         expt_data["Unique_Col"] = expt_data[col_col].astype(str)
         expt_data["Global_Group"] = 1
@@ -259,11 +260,9 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
                     name = extract_genotype_name(key, "Female_GCA")
                     female_gca[name] = val
 
-            # --- 3. Build DataFrames & Merge Stats ---
             if male_gca:
                 df_m = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
                 df_m.index.name = 'Male Parent'
-                # Merge with counts/SE
                 df_m = df_m.join(male_stats, how='left')
                 df_m.reset_index(inplace=True)
                 df_m['Group'] = expt
@@ -272,13 +271,12 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
             if female_gca:
                 df_f = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f'GCA_{trait}'])
                 df_f.index.name = 'Female Parent'
-                # Merge with counts/SE
                 df_f = df_f.join(female_stats, how='left')
                 df_f.reset_index(inplace=True)
                 df_f['Group'] = expt
                 female_results.append(df_f)
 
-            debug_messages.append(f"\n--- {expt} Success ---")
+            debug_messages.append(f"\n{'='*30}\nMODEL OUTPUT: {expt}\n{'='*30}\n{result.summary().as_text()}")
 
         except Exception as e:
             debug_messages.append(f"[{expt}] ERROR: {str(e)}")
@@ -305,7 +303,6 @@ def main():
     if 'analysis_mode' not in st.session_state: st.session_state.analysis_mode = "Analyze experiments separately"
     if 'trait_ran' not in st.session_state: st.session_state.trait_ran = None
     
-    # GCA Specific State (Fixes the download reset bug)
     if 'gca_male_df' not in st.session_state: st.session_state.gca_male_df = None
     if 'gca_female_df' not in st.session_state: st.session_state.gca_female_df = None
     if 'gca_debug' not in st.session_state: st.session_state.gca_debug = None
@@ -441,18 +438,68 @@ def main():
             st.session_state.trait_ran = perf_trait
             st.session_state.analysis_mode_ran = st.session_state.analysis_mode 
 
+        # --- RESULTS DISPLAY ---
         if st.session_state.results_df is not None and st.session_state.trait_ran is not None:
             res_df = st.session_state.results_df
-            st.subheader(f"Results for: {st.session_state.trait_ran}")
+            trait_ran = st.session_state.trait_ran
             
+            st.subheader(f"Results for: {trait_ran}")
+            
+            # --- 1. EXPERIMENT SUMMARY TABLE ---
             if st.session_state.stats_df is not None:
-                st.dataframe(st.session_state.stats_df, use_container_width=True)
+                st.markdown("### 📋 Experiment Analysis Summary")
+                
+                # Function to color code status
+                def color_status_rows(row):
+                    color = ''
+                    if 'Good' in row['Status']:
+                        color = 'background-color: #d4edda; color: #155724' # Green
+                    elif 'Caution' in row['Status']:
+                        color = 'background-color: #fff3cd; color: #856404' # Yellow/Orange
+                    elif 'Failed' in row['Status']:
+                        color = 'background-color: #f8d7da; color: #721c24' # Red
+                    return [color] * len(row)
 
-            current_view = res_df.sort_values(by=f"Predicted_{st.session_state.trait_ran}", ascending=False)
-            st.dataframe(current_view)
-            st.download_button("Download Results (CSV)", res_df.to_csv().encode('utf-8'), "Genotype_Results.csv")
+                stats_styled = st.session_state.stats_df.style.apply(color_status_rows, axis=1)
+                st.dataframe(stats_styled, use_container_width=True, hide_index=True)
+                
+                # Dedicated Download Button for Summary (Fixes Issue 4)
+                st.download_button(
+                    "Download Summary Table (CSV)",
+                    st.session_state.stats_df.to_csv(index=False).encode('utf-8'),
+                    "Experiment_Summary_Stats.csv"
+                )
+                st.divider()
 
-    # --- TAB 4: PARENTAL GCA (UPDATED) ---
+            # --- 2. GENOTYPE RESULTS TABLE ---
+            st.markdown("### 🏆 Genotype Rankings")
+            
+            # Sort by Predicted Value
+            current_view = res_df.sort_values(by=f"Predicted_{trait_ran}", ascending=False)
+            
+            # Apply Gradient Coloring (Heatmap)
+            # Target columns: BLUP_{trait} and Predicted_{trait}
+            cols_to_color = [f'BLUP_{trait_ran}', f'Predicted_{trait_ran}']
+            
+            styled_results = current_view.style.background_gradient(
+                subset=cols_to_color, 
+                cmap="Blues"
+            ).format({
+                f'BLUP_{trait_ran}': "{:.3f}",
+                f'Predicted_{trait_ran}': "{:.3f}",
+                'Raw_SE': "{:.3f}"
+            })
+            
+            st.dataframe(styled_results, use_container_width=True, hide_index=True)
+            
+            st.download_button("Download Genotype Results (CSV)", res_df.to_csv().encode('utf-8'), f"Genotype_Results_{trait_ran}.csv")
+
+            # --- 3. MODEL OUTPUT DROPDOWN (Req 1) ---
+            with st.expander("Model Outputs & Logs (Detailed Stats)"):
+                st.text(st.session_state.debug_log)
+
+
+    # --- TAB 4: PARENTAL GCA ---
     with tab_parents:
         if not gca_enabled:
             st.header("Parental GCA Disabled")
@@ -468,14 +515,12 @@ def main():
             
             gca_trait = st.selectbox("Trait for GCA", selected_traits, key='gca_trait')
             
-            # 1. CALCULATE BUTTON
             if st.button("Calculate GCA", key='run_gca_btn', type='primary'):
                 success, male_df, female_df, debug = run_parental_model(
                     df_clean, gca_trait, col_map['male'], col_map['female'], col_map['row'], col_map['col'], col_map['expt']
                 )
                 
                 if success:
-                    # SAVE TO SESSION STATE
                     st.session_state.gca_male_df = male_df
                     st.session_state.gca_female_df = female_df
                     st.session_state.gca_debug = debug
@@ -484,65 +529,36 @@ def main():
                     st.error("GCA Model Failed")
                     st.text(debug)
 
-            # 2. DISPLAY LOGIC (OUTSIDE BUTTON for persistence)
             if st.session_state.gca_male_df is not None or st.session_state.gca_female_df is not None:
-                
-                # Ensure we are looking at the right trait
                 st.caption(f"Showing results for: **{st.session_state.gca_trait_ran}**")
-                
                 col_m, col_f = st.columns(2)
                 
-                # MALE TABLE
                 with col_m:
                     st.subheader("Male Parent Results")
                     if st.session_state.gca_male_df is not None:
                         m_df = st.session_state.gca_male_df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
-                        
-                        # Format columns for readability
                         m_df['Raw_SE'] = m_df['Raw_SE'].round(2)
-                        
-                        # Display with hide_index=True (Fixes Issue 1)
                         st.dataframe(
                             m_df.style.background_gradient(subset=[f"GCA_{st.session_state.gca_trait_ran}"], cmap="Blues"), 
-                            use_container_width=True,
-                            hide_index=True 
+                            use_container_width=True, hide_index=True 
                         )
-                        
-                        # Download Button (Fixes Issue 3)
-                        st.download_button(
-                            f"Download Male GCA (CSV)", 
-                            m_df.to_csv(index=False).encode('utf-8'), 
-                            f"Male_GCA_{st.session_state.gca_trait_ran}.csv",
-                            key='dl_male_gca'
-                        )
+                        st.download_button(f"Download Male GCA (CSV)", m_df.to_csv(index=False).encode('utf-8'), f"Male_GCA_{st.session_state.gca_trait_ran}.csv", key='dl_male_gca')
                     else:
                         st.info("No Male GCA calculated.")
 
-                # FEMALE TABLE
                 with col_f:
                     st.subheader("Female Parent Results")
                     if st.session_state.gca_female_df is not None:
                         f_df = st.session_state.gca_female_df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
-                        
-                        # Format columns
                         f_df['Raw_SE'] = f_df['Raw_SE'].round(2)
-
-                        # Display with hide_index=True (Fixes Issue 1)
                         st.dataframe(
                             f_df.style.background_gradient(subset=[f"GCA_{st.session_state.gca_trait_ran}"], cmap="Reds"), 
-                            use_container_width=True,
-                            hide_index=True
+                            use_container_width=True, hide_index=True
                         )
-                        
-                        # Download Button (Fixes Issue 3)
-                        st.download_button(
-                            f"Download Female GCA (CSV)", 
-                            f_df.to_csv(index=False).encode('utf-8'), 
-                            f"Female_GCA_{st.session_state.gca_trait_ran}.csv",
-                            key='dl_female_gca'
-                        )
+                        st.download_button(f"Download Female GCA (CSV)", f_df.to_csv(index=False).encode('utf-8'), f"Female_GCA_{st.session_state.gca_trait_ran}.csv", key='dl_female_gca')
 
-                with st.expander("Debug Logs"):
+                # --- MODEL OUTPUT DROPDOWN (Req 1) ---
+                with st.expander("Model Outputs & Logs (Detailed Stats)"):
                     st.text(st.session_state.gca_debug)
 
 if __name__ == "__main__":
