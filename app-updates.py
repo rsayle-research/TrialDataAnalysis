@@ -25,44 +25,44 @@ def extract_genotype_name(key, prefix="Genotype"):
     # First, check if this key starts with the expected prefix
     if not key.startswith(f"{prefix}["):
         return key
-    
+
     # Remove the prefix part
     key_content = key[len(prefix)+1:]  # Remove "Genotype[" or "Male_GCA[" etc.
-    
+
     # Look for pattern "C(column_name)[actual_value]"
     # This handles the statsmodels categorical variable encoding
     match = re.search(r'C\([^)]+\)\[([^\]]+)\]', key_content)
     if match:
         return match.group(1)
-    
+
     # Fallback: just extract content from the outermost brackets
     if key_content.endswith(']'):
         key_content = key_content[:-1]
-    
+
     # If there's still a bracket structure, get the innermost value
     inner_match = re.search(r'\[([^\]]+)\]$', key_content)
     if inner_match:
         return inner_match.group(1)
-    
+
     return key_content
 
 def clean_curveballs(df, traits):
     log = []
     df_clean = df.copy()
-    
+
     for trait in traits:
         # 1. Force Numeric
         if not pd.api.types.is_numeric_dtype(df_clean[trait]):
             df_clean[trait] = pd.to_numeric(df_clean[trait], errors='coerce')
             log.append(f"⚠️ Column '{trait}' contained non-numeric data. Values converted to NA.")
-        
+
         # 2. Negative Value Detection
         neg_mask = df_clean[trait] < 0
         neg_count = neg_mask.sum()
         if neg_count > 0:
             df_clean.loc[neg_mask, trait] = np.nan
             log.append(f"🚨 **CRITICAL:** Found {neg_count} negative values in '{trait}'. Set to NA.")
-            
+
     return df_clean, log
 
 def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_separate):
@@ -70,11 +70,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
     Runs LMM for Genotype Performance (BLUPs), including spatial correction.
     """
     progress_bar = st.progress(0, text="Initializing Model...")
-    
+
     results_container = []
     summary_stats = []
     debug_log = []
-    
+
     # Define datasets to iterate over
     if analyze_separate:
         datasets = [(expt, df[df[expt_col] == expt].copy()) for expt in df[expt_col].unique()]
@@ -85,17 +85,17 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
     for i, (run_name, model_data) in enumerate(datasets):
         step_val = int((i / total_runs) * 100)
-        
+
         progress_bar.progress(step_val, text=f"Processing **{run_name}**: Preparing Matrix...")
-        
+
         # Initialize status tracking
         convergence_status = "❌ Failed"
         convergence_message = ""
         optimizer_used = "None"
-        
+
         try:
             model_data = model_data.dropna(subset=[trait, gen_col, row_col, col_col]).copy()
-            
+
             # Ensure enough data for modeling
             if model_data[gen_col].nunique() < 2:
                  debug_log.append(f"ERROR in {run_name}: Not enough unique genotypes ({model_data[gen_col].nunique()}) to run the model.")
@@ -139,18 +139,18 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             random_effects_formula = f"Random Effects: (1|{gen_col}) + (1|Unique_Row) + (1|Unique_Col)"
 
             debug_log.append(f"--- {run_name} Complete Model Formula ---\n{fixed_effects_formula}\n{random_effects_formula}")
-            
+
             progress_bar.progress(
                 min(step_val + 10, 100),
                 text=f"Processing **{run_name}**: Fitting Spatial Model (REML)..."
             )
 
-            
+
             # Try multiple optimizers for robustness
             model = smf.mixedlm(formula, model_data, groups="Global_Group", vc_formula=vc)
             result = None
             optimizers = ['powell', 'lbfgs', 'bfgs']
-            
+
             for opt in optimizers:
                 try:
                     result = model.fit(method=opt, reml=True)
@@ -174,20 +174,20 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                     if opt == optimizers[-1]:  # Last optimizer failed
                         raise Exception(f"All optimizers failed. Last error: {str(opt_error)}")
                     continue
-            
+
             if result is None:
                 raise Exception("Model fitting failed with all optimizers")
-            
+
             progress_bar.progress(
                 min(step_val + 20, 100),
                 text=f"Processing **{run_name}**: Extracting BLUPs..."
             )
 
-            
+
             # Extract & Clean Genotype BLUPs
             re_dict = result.random_effects[1]
             geno_blups = {}
-            
+
             for key, val in re_dict.items():
                 if key.startswith("Genotype["):
                     # Use improved extraction function
@@ -197,12 +197,12 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             # Create DataFrame
             temp_df = pd.DataFrame.from_dict(geno_blups, orient='index', columns=[f'BLUP_{trait}'])
             temp_df.index.name = 'Genotype'
-            
+
             # Add Intercept (Fixed Effect Mean)
             intercept = result.params.get('Intercept', 0)
             temp_df[f'Predicted_{trait}'] = temp_df[f'BLUP_{trait}'] + intercept
             temp_df['Analysis_Group'] = run_name
-            
+
             results_container.append(temp_df)
             debug_log.append(f"--- {run_name} Summary ---\n{result.summary().as_text()}")
 
@@ -214,12 +214,12 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                     v_g = result.vcomp[0]  # Genotype variance
             except:
                 v_g = None
-            
+
             v_e = result.scale  # residual variance
-            
+
             h2 = 'N/A'
             h2_val = None
-            
+
             # Check for problematic variance components
             if v_g is None or v_g <= 0:
                 convergence_status = "⚠️ Caution"
@@ -231,11 +231,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             elif v_e is not None and model_data[gen_col].nunique() > 1:
                 # Avg replication estimate based on total plots / total unique genotypes
                 avg_plots_per_geno = model_data.groupby(gen_col).size().mean()
-                
+
                 # Formula: H^2 = Vg / ( Vg + Ve / n_plots)
                 h2_val = v_g / (v_g + (v_e / avg_plots_per_geno))
                 h2 = round(h2_val * 100, 1)
-                
+
                 # Update status based on heritability
                 if convergence_status == "✓ Good":
                     if h2_val < 0.10:  # Less than 10%
@@ -248,7 +248,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
             mean = model_data[trait].mean()
             std_dev = model_data[trait].std()
             cv = (std_dev / mean) * 100 if mean != 0 else 0
-            
+
             summary_stats.append({
                 'Experiment ID': run_name,
                 'Status': convergence_status,
@@ -262,7 +262,7 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                 'Plots': len(model_data),
                 'Unique Genotypes': model_data[gen_col].nunique()
             })
-            
+
         except Exception as e:
             error_msg = str(e)
             # Make error messages more user-friendly
@@ -272,9 +272,9 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                 user_msg = "Model couldn't find a stable solution"
             else:
                 user_msg = error_msg[:100]  # Truncate long errors
-                
+
             debug_log.append(f"ERROR in {run_name}: {error_msg}")
-            
+
             summary_stats.append({
                 'Experiment ID': run_name,
                 'Status': "❌ Failed",
@@ -288,13 +288,13 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
                 'Plots': len(model_data) if 'model_data' in locals() else 0,
                 'Unique Genotypes': model_data[gen_col].nunique() if 'model_data' in locals() else 0
             })
-    
+
     progress_bar.progress(100, text="Finalizing Results...")
     time.sleep(0.5)
     progress_bar.empty()
-    
+
     stats_df = pd.DataFrame(summary_stats)
-    
+
     if results_container:
         final_df = pd.concat(results_container)
         return True, final_df, stats_df, "\n".join(debug_log)
@@ -303,57 +303,61 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
 def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_col):
     """
-    NEW IMPLEMENTATION:
-    Runs the GCA model **separately for each selected experiment**.
-    Returns combined per-experiment GCA values for Male & Female parents.
-    Adds a new column 'Group' indicating the experiment name.
+    REPLACED FUNCTION — Runs GCA per experiment and returns stacked results.
+
+    Returns:
+        success (bool),
+        df_male (pd.DataFrame) or None,
+        df_female (pd.DataFrame) or None,
+        debug_log (str)
     """
 
-    progress_bar = st.progress(0, text="Initializing GCA Analysis...")
+    progress_bar = st.progress(0, text="Calculating GCA (Parental BLUPs)...")
 
     male_results = []
     female_results = []
-    debug_log = []
+    debug_messages = []
 
-    expts = df[expt_col].unique().tolist()
-    total = len(expts)
+    # Determine experiments present in the provided dataframe
+    experiments = df[expt_col].dropna().unique().tolist()
+    total = max(1, len(experiments))
 
-    for i, expt in enumerate(expts):
+    for i, expt in enumerate(experiments):
         progress_bar.progress(int((i / total) * 100), text=f"Running GCA for {expt}...")
-        
-        data_expt = df[df[expt_col] == expt].dropna(
+
+        # Work on a per-experiment subset, require non-missing essential cols
+        expt_data = df[df[expt_col] == expt].dropna(
             subset=[trait, male_col, female_col, row_col, col_col]
         ).copy()
 
-        # Skip empty or invalid datasets
-        if data_expt.empty:
-            debug_log.append(f"[{expt}] Skipped: No valid rows.")
+        if expt_data.empty:
+            debug_messages.append(f"[{expt}] Skipped: no valid rows after dropping NA.")
             continue
 
-        # Build spatial ID columns
-        data_expt["Unique_Row"] = data_expt[row_col].astype(str)
-        data_expt["Unique_Col"] = data_expt[col_col].astype(str)
-        data_expt["Global_Group"] = 1
+        # Create Unique Spatial IDs (local to experiment)
+        expt_data["Unique_Row"] = expt_data[row_col].astype(str)
+        expt_data["Unique_Col"] = expt_data[col_col].astype(str)
+        expt_data["Global_Group"] = 1
 
-        # Fixed Effects — since running per experiment, only intercept is used
+        # Since we're analyzing a single experiment at a time, use intercept-only fixed effect
         formula = f"{trait} ~ 1"
-
-        # Random Effects
         vc = {
             "Male_GCA": f"0 + C({male_col})",
             "Female_GCA": f"0 + C({female_col})",
             "SpatialRow": "0 + C(Unique_Row)",
             "SpatialCol": "0 + C(Unique_Col)"
         }
+        random_effects_formula = f"Random Effects: (1|{male_col}) + (1|{female_col}) + (1|Unique_Row) + (1|Unique_Col)"
+        fixed_effects_formula = "Fixed Effects: Intercept"
 
-        # Fit model
         try:
-            model = smf.mixedlm(formula, data_expt, groups="Global_Group", vc_formula=vc)
+            progress_bar.progress(min(int((i / total) * 100) + 10, 90), text=f"Fitting model for {expt}...")
+            model = smf.mixedlm(formula, expt_data, groups="Global_Group", vc_formula=vc)
             result = model.fit(method='powell', reml=True)
 
+            # random_effects[1] holds the dictionary of vc-level effects
             re_dict = result.random_effects[1]
 
-            # Extract GCA values
             male_gca = {}
             female_gca = {}
 
@@ -365,43 +369,44 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
                     name = extract_genotype_name(key, "Female_GCA")
                     female_gca[name] = val
 
-            # Convert to DataFrames & add group column
-            df_m = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f"GCA_{trait}"])
-            df_m.index.name = 'Male Parent'
-            df_m["Group"] = expt
-            male_results.append(df_m)
+            # Convert to dataframes, reset index to avoid non-unique index issues
+            if male_gca:
+                df_m = pd.DataFrame.from_dict(male_gca, orient='index', columns=[f'GCA_{trait}'])
+                df_m.index.name = 'Male Parent'
+                df_m.reset_index(inplace=True)
+                df_m['Group'] = expt
+                male_results.append(df_m)
+            else:
+                debug_messages.append(f"[{expt}] No Male_GCA values extracted.")
 
-            df_f = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f"GCA_{trait}"])
-            df_f.index.name = 'Female Parent'
-            df_f["Group"] = expt
-            female_results.append(df_f)
+            if female_gca:
+                df_f = pd.DataFrame.from_dict(female_gca, orient='index', columns=[f'GCA_{trait}'])
+                df_f.index.name = 'Female Parent'
+                df_f.reset_index(inplace=True)
+                df_f['Group'] = expt
+                female_results.append(df_f)
+            else:
+                debug_messages.append(f"[{expt}] No Female_GCA values extracted.")
 
-            debug_log.append(
-                f"\n--- GCA Model Summary ({expt}) ---\n{result.summary().as_text()}\n"
-            )
+            debug_messages.append(f"\n--- GCA Model Summary ({expt}) ---\n{result.summary().as_text()}\n")
 
         except Exception as e:
-            debug_log.append(f"[{expt}] Error: {str(e)}")
+            debug_messages.append(f"[{expt}] ERROR: {str(e)}")
+            # continue to next experiment rather than fail everything
+            continue
 
     progress_bar.progress(100, text="Finalizing GCA Results...")
+    time.sleep(0.2)
     progress_bar.empty()
 
-    # Combine across experiments
-    if male_results:
-        male_final = pd.concat(male_results)
-    else:
-        male_final = None
+    # Concatenate per-experiment results (if any) and return
+    male_df = pd.concat(male_results, ignore_index=True) if male_results else None
+    female_df = pd.concat(female_results, ignore_index=True) if female_results else None
 
-    if female_results:
-        female_final = pd.concat(female_results)
-    else:
-        female_final = None
+    # Final return structure matches original expectations
+    success_flag = True if (male_df is not None or female_df is not None) else False
+    return success_flag, male_df, female_df, "\n".join(debug_messages)
 
-    # Return
-    if male_final is None or female_final is None:
-        return False, male_final, female_final, "\n".join(debug_log)
-
-    return True, male_final, female_final, "\n".join(debug_log)
 
 # --- MAIN APP ---
 
@@ -426,7 +431,7 @@ def main():
     st.sidebar.header("1. Upload Data")
     uploaded_file = st.sidebar.file_uploader("Upload CSV", type=['csv'])
     df = None
-    
+
     if uploaded_file:
         try:
             df = pd.read_csv(uploaded_file)
@@ -442,22 +447,22 @@ def main():
         st.sidebar.divider()
         st.sidebar.header("2. Map Columns")
         st.sidebar.info("Please identify the columns in your file.")
-        
+
         all_cols = ["Select Column..."] + df.columns.tolist()
-        
+
         col_map['expt'] = st.sidebar.selectbox("Experiment ID", all_cols)
         col_map['geno'] = st.sidebar.selectbox("Genotype", all_cols)
         col_map['row'] = st.sidebar.selectbox("Plot Row", all_cols)
         col_map['col'] = st.sidebar.selectbox("Plot Column", all_cols)
-        
+
         # Optional Parent Columns
         with st.sidebar.expander("GCA Parental Lines (Optional)"):
             st.info("GCA analysis can be performed if parental lines are selected for hybrid crops.")
             col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
             col_map['female'] = st.selectbox("Female Parent (Required for GCA)", all_cols)
-        
+
         gca_enabled = (col_map['male'] != "Select Column...") and (col_map['female'] != "Select Column...")
-        
+
         # Check if mapping is complete (required columns only)
         required_cols = ['expt', 'geno', 'row', 'col']
         if any(col_map[key] == "Select Column..." for key in required_cols):
@@ -468,7 +473,7 @@ def main():
         st.sidebar.header("3. Filter & Configure")
         unique_expts = df[col_map['expt']].unique().tolist()
         selected_expts = st.sidebar.multiselect("Select Experiments to Include", unique_expts, default=unique_expts)
-        
+
         potential_traits = [c for c in df.columns if c not in col_map.values() or c == "Select Column..."]
         selected_traits = st.sidebar.multiselect("Select Phenotypes", potential_traits)
 
@@ -505,19 +510,19 @@ def main():
                     st.warning(msg)
         else:
             st.success("No statistical anomalies detected in selected traits.")
-        
+
         st.subheader("Summary Statistics")
         c_stats, c_missing = st.columns(2)
-        
+
         with c_stats:
             st.markdown(f"**Selected Experiments:** `{len(selected_expts)}`")
             st.markdown(f"**Total Plots:** `{len(df_clean)}`")
             st.markdown(f"**Unique Genotypes:** `{df_clean[col_map['geno']].nunique()}`")
-        
+
         with c_missing:
             st.subheader("Missing Values Count")
             st.dataframe(df_clean[selected_traits].isnull().sum(), use_container_width=True)
-        
+
         st.empty() 
 
     # --- TAB 2: SPATIAL ---
@@ -526,7 +531,7 @@ def main():
         c1, c2 = st.columns([1, 3])
         map_trait = c1.selectbox("View Trait", selected_traits, key='map_trait')
         map_expt = c1.selectbox("View Experiment", selected_expts, key='map_expt')
-        
+
         map_data = df_clean[df_clean[col_map['expt']] == map_expt]
         if not map_data.empty:
             pivot = map_data.pivot_table(index=col_map['row'], columns=col_map['col'], values=map_trait)
@@ -707,25 +712,34 @@ def main():
                     c_male, c_fem = st.columns(2)
                     
                     c_male.subheader(f"Male GCA (Trait: {gca_trait})")
-                    male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
-                    c_male.dataframe(male_df.style.background_gradient(cmap="Blues"), use_container_width=True)
-                    
-                    c_fem.subheader(f"Female GCA (Trait: {gca_trait})")
-                    female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
-                    c_fem.dataframe(female_df.style.background_gradient(cmap="Reds"), use_container_width=True)
+                    if male_df is not None:
+                        male_df = male_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                        # index is reset inside run_parental_model so Styler won't error
+                        c_male.dataframe(male_df.style.background_gradient(cmap="Blues"), use_container_width=True)
+                    else:
+                        c_male.info("No Male GCA results to show.")
 
-                    st.download_button(
-                        f"Download Male GCA for {gca_trait} (CSV)", 
-                        male_df.to_csv().encode('utf-8'), 
-                        f"Male_GCA_{gca_trait}.csv",
-                        key='dl_male_gca'
-                    )
-                    st.download_button(
-                        f"Download Female GCA for {gca_trait} (CSV)", 
-                        female_df.to_csv().encode('utf-8'), 
-                        f"Female_GCA_{gca_trait}.csv",
-                        key='dl_female_gca'
-                    )
+                    c_fem.subheader(f"Female GCA (Trait: {gca_trait})")
+                    if female_df is not None:
+                        female_df = female_df.sort_values(by=f"GCA_{gca_trait}", ascending=False)
+                        c_fem.dataframe(female_df.style.background_gradient(cmap="Reds"), use_container_width=True)
+                    else:
+                        c_fem.info("No Female GCA results to show.")
+
+                    if male_df is not None:
+                        st.download_button(
+                            f"Download Male GCA for {gca_trait} (CSV)", 
+                            male_df.to_csv(index=False).encode('utf-8'), 
+                            f"Male_GCA_{gca_trait}.csv",
+                            key='dl_male_gca'
+                        )
+                    if female_df is not None:
+                        st.download_button(
+                            f"Download Female GCA for {gca_trait} (CSV)", 
+                            female_df.to_csv(index=False).encode('utf-8'), 
+                            f"Female_GCA_{gca_trait}.csv",
+                            key='dl_female_gca'
+                        )
                         
                     with st.expander("Complete GCA Model Output (Debug)"):
                         st.text(debug)
