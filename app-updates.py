@@ -175,9 +175,11 @@ def run_hybrid_model(df, trait, gen_col, row_col, col_col, expt_col, analyze_sep
 
             summary_stats.append({
                 'Experiment ID': run_name, 'Status': convergence_status, 'Message': convergence_message,
-                'Optimizer': optimizer_used, 'Mean': round(mean, 3), 'CV (%)': round(cv, 1),
-                'Genotype Var (Vg)': round(v_g, 3) if v_g is not None and v_g > 0 else 'N/A',
-                'Residual Var (Ve)': round(v_e, 3) if v_e is not None else 'N/A',
+                'Optimizer': optimizer_used, 
+                'Mean': round(mean, 2), 
+                'CV (%)': round(cv, 2),
+                'Genotype Var (Vg)': round(v_g, 2) if v_g is not None and v_g > 0 else 'N/A',
+                'Residual Var (Ve)': round(v_e, 2) if v_e is not None else 'N/A',
                 'Est. Heritability (H2, %)': h2,
                 'Plots': len(model_data), 'Unique Genotypes': model_data[gen_col].nunique()
             })
@@ -456,7 +458,8 @@ def main():
                         color = 'background-color: #f8d7da; color: #721c24' # Red
                     return [color] * len(row)
 
-                stats_styled = st.session_state.stats_df.style.apply(color_status_rows, axis=1)
+                # Add .format(precision=2) here to fix the decimal places
+                stats_styled = st.session_state.stats_df.style.apply(color_status_rows, axis=1).format(precision=2)
                 st.dataframe(stats_styled, use_container_width=True, hide_index=True)
                 
                 st.download_button(
