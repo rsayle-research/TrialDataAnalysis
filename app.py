@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import statsmodels.formula.api as smf
+from sklearn.linear_model import Ridge
 import re
 import time
 
@@ -290,6 +291,120 @@ def run_parental_model(df, trait, male_col, female_col, row_col, col_col, expt_c
     success_flag = True if (male_df is not None or female_df is not None) else False
     return success_flag, male_df, female_df, "\n".join(debug_messages)
 
+# --- NEW HELPER FUNCTIONS FOR GENETICS ---
+
+def get_pedigree_matrix(df, geno_col, male_col, female_col):
+    """Calculates the Numerator Relationship Matrix (A-Matrix) from pedigree columns."""
+    # 1. Identify all individuals (Parents + Hybrids)
+    parents = set(df[male_col].dropna().unique()) | set(df[female_col].dropna().unique())
+    hybrids = set(df[geno_col].unique())
+    
+    # 2. Build Pedigree Table
+    ped_data = []
+    # Add pure parents (Generation 0)
+    for p in parents:
+        ped_data.append({'ID': p, 'Sire': None, 'Dam': None, 'Generation': 0})
+    
+    # Add hybrids (Generation 1)
+    # Drop duplicates to ensure one entry per hybrid
+    hybrid_map = df[[geno_col, male_col, female_col]].drop_duplicates(subset=[geno_col])
+    for _, row in hybrid_map.iterrows():
+        if row[geno_col] not in parents:
+            ped_data.append({
+                'ID': row[geno_col], 
+                'Sire': row[male_col], 
+                'Dam': row[female_col], 
+                'Generation': 1
+            })
+            
+    ped_df = pd.DataFrame(ped_data).sort_values('Generation').reset_index(drop=True)
+    
+    # 3. Initialize Matrix
+    n = len(ped_df)
+    A = np.zeros((n, n))
+    id_map = {name: i for i, name in enumerate(ped_df['ID'])}
+    
+    # 4. Fill Matrix (Henderson's Method)
+    for i in range(n):
+        sire = ped_df.loc[i, 'Sire']
+        dam = ped_df.loc[i, 'Dam']
+        sire_idx = id_map.get(sire)
+        dam_idx = id_map.get(dam)
+        
+        # Diagonal (Self)
+        if sire_idx is not None and dam_idx is not None:
+            A[i, i] = 1.0 + (0.5 * A[sire_idx, dam_idx])
+        else:
+            A[i, i] = 1.0 
+            
+        # Off-Diagonal
+        for j in range(i):
+            rel_sire = A[j, sire_idx] if sire_idx is not None else 0.0
+            rel_dam = A[j, dam_idx] if dam_idx is not None else 0.0
+            val = 0.5 * (rel_sire + rel_dam)
+            A[i, j] = val
+            A[j, i] = val
+            
+    return pd.DataFrame(A, index=ped_df['ID'], columns=ped_df['ID'])
+
+def run_ablup_model(pheno_df, a_matrix, trait_col):
+    """
+    Runs Stage 2: A-BLUP using Spatially Corrected Phenotypes + A-Matrix.
+    Returns: success (bool), results (df), log (str)
+    """
+    log = []
+    log.append("--- A-BLUP MODEL LOG ---")
+    
+    # 1. Align Data
+    common_genos = list(set(pheno_df.index) & set(a_matrix.index))
+    log.append(f"Genotypes in Phenotype Data: {len(pheno_df)}")
+    log.append(f"Genotypes in Pedigree Matrix: {len(a_matrix)}")
+    log.append(f"Overlapping Genotypes (N): {len(common_genos)}")
+    
+    if len(common_genos) < 2:
+        return False, None, "Not enough overlapping genotypes between Pedigree and Field Data."
+
+    # Handle duplicates if multiple experiments were analyzed separately (Take Mean)
+    if pheno_df.index.duplicated().any():
+        y = pheno_df.groupby(level=0)[f"Predicted_{trait_col}"].mean()
+        y = y.loc[common_genos]
+        log.append("Note: Duplicate genotypes found in spatial results. Averaged their BLUEs.")
+    else:
+        y = pheno_df.loc[common_genos, f"Predicted_{trait_col}"]
+
+    K = a_matrix.loc[common_genos, common_genos] # The Kinship Kernel
+    
+    # 2. Run Kernel Ridge Regression
+    # alpha = Ve/Vg. Defaulting to 1.0 (Assuming H2 = 0.5) for stability in this MVP.
+    alpha_val = 1.0 
+    model = Ridge(alpha=alpha_val, fit_intercept=True)
+    model.fit(K, y)
+    
+    # 3. Predict (GEBV)
+    # In Ridge, the 'dual_coef_' * Kernel gives the random effects (Breeding Values)
+    # However, model.predict(K) returns Fixed Intercept + Random Effects
+    preds = model.predict(K)
+    
+    # Calculate pure Breeding Value (GEBV) by subtracting intercept
+    intercept = model.intercept_
+    gebvs = preds - intercept
+    
+    log.append(f"\nModel Parameters:")
+    log.append(f"  Trait: {trait_col}")
+    log.append(f"  Solver: Ridge Regression (scikit-learn)")
+    log.append(f"  Shrinkage Parameter (alpha): {alpha_val}")
+    log.append(f"  Estimated Intercept (Grand Mean): {intercept:.4f}")
+    log.append(f"  Mean GEBV: {np.mean(gebvs):.4f}")
+    log.append(f"  Min/Max GEBV: {np.min(gebvs):.4f} / {np.max(gebvs):.4f}")
+    
+    results = pd.DataFrame({
+        'Genotype': common_genos,
+        'Spatially_Corrected_Phenotype': y.values,
+        'GEBV_Breeding_Value': gebvs,
+        'Total_Predicted_Value': preds
+    })
+    
+    return True, results, "\n".join(log)
 
 # --- MAIN APP ---
 
@@ -334,10 +449,10 @@ def main():
         col_map['row'] = st.sidebar.selectbox("Plot Row", all_cols)
         col_map['col'] = st.sidebar.selectbox("Plot Column", all_cols)
 
-        with st.sidebar.expander("GCA Parental Lines (Optional)"):
-            st.info("GCA analysis can be performed if parental lines are selected for hybrid crops.")
-            col_map['male'] = st.selectbox("Male Parent (Required for GCA)", all_cols)
-            col_map['female'] = st.selectbox("Female Parent (Required for GCA)", all_cols)
+        with st.sidebar.expander("Parental Lines (For GCA & A-BLUP)"):
+            st.info("Required for GCA and Pedigree Analysis (A-BLUP).")
+            col_map['male'] = st.selectbox("Male Parent", all_cols)
+            col_map['female'] = st.selectbox("Female Parent", all_cols)
 
         gca_enabled = (col_map['male'] != "Select Column...") and (col_map['female'] != "Select Column...")
 
@@ -367,11 +482,13 @@ def main():
 
     # --- TABS ---
     gca_tab_title = f"👨‍👩‍👧 Parental GCA ({'Ready' if gca_enabled else 'Disabled'})"
-    tab_qc, tab_spatial, tab_perf, tab_parents = st.tabs([
+    
+    tab_qc, tab_spatial, tab_perf, tab_parents, tab_gblup = st.tabs([
         "🛡️ QC & Cleaning", 
         "🗺️ Spatial Analysis", 
         "📊 Genotype Performance", 
-        gca_tab_title
+        gca_tab_title,
+        "🧬 Genetic Prediction (A-BLUP)"
     ])
 
     # --- TAB 1: QC ---
@@ -447,7 +564,6 @@ def main():
             if st.session_state.stats_df is not None:
                 st.markdown("### 📋 Experiment Analysis Summary")
                 
-                # Color Status Rows
                 def color_status_rows(row):
                     color = ''
                     if 'Good' in row['Status']:
@@ -458,7 +574,6 @@ def main():
                         color = 'background-color: #f8d7da; color: #721c24' # Red
                     return [color] * len(row)
 
-                # Add .format(precision=2) here to fix the decimal places
                 stats_styled = st.session_state.stats_df.style.apply(color_status_rows, axis=1).format(precision=2)
                 st.dataframe(stats_styled, use_container_width=True, hide_index=True)
                 
@@ -472,16 +587,12 @@ def main():
             # --- 2. GENOTYPE RESULTS TABLE ---
             st.markdown("### 🏆 Genotype Rankings")
             
-            # Fix for KeyError: Reset index so Genotype becomes a column and Index is unique (0,1,2...)
+            # Reset index so Genotype becomes a column
             current_view = res_df.sort_values(by=f"Predicted_{trait_ran}", ascending=False).reset_index()
-            
-            # Round data for clean CSV download
             current_view_clean = current_view.round(3)
             
-            # Apply Gradient Coloring (Heatmap)
             cols_to_color = [f'BLUP_{trait_ran}', f'Predicted_{trait_ran}']
             
-            # Style with strict formatting
             styled_results = current_view_clean.style.background_gradient(
                 subset=cols_to_color, 
                 cmap="Blues"
@@ -495,10 +606,8 @@ def main():
                 f"Genotype_Results_{trait_ran}.csv"
             )
 
-            # --- 3. MODEL OUTPUT DROPDOWN ---
             with st.expander("Model Outputs & Logs (Detailed Stats)"):
                 st.text(st.session_state.debug_log)
-
 
     # --- TAB 4: PARENTAL GCA ---
     with tab_parents:
@@ -534,11 +643,9 @@ def main():
                 st.caption(f"Showing results for: **{st.session_state.gca_trait_ran}**")
                 col_m, col_f = st.columns(2)
                 
-                # Helper for GCA tables
                 def display_gca_table(df, title, color_map, dl_name):
                     st.subheader(title)
                     if df is not None:
-                        # Sort and Round
                         df_sorted = df.sort_values(by=f"GCA_{st.session_state.gca_trait_ran}", ascending=False)
                         df_clean = df_sorted.round(3)
                         
@@ -570,9 +677,122 @@ def main():
                         f"Female_GCA_{st.session_state.gca_trait_ran}.csv"
                     )
 
-                # --- MODEL OUTPUT DROPDOWN ---
                 with st.expander("Model Outputs & Logs (Detailed Stats)"):
                     st.text(st.session_state.gca_debug)
+
+    # --- TAB 5: GENETIC PREDICTION (A-BLUP) ---
+    with tab_gblup:
+        st.header("Genetic Prediction (A-BLUP)")
+        
+        st.info("""
+        **What is this?**
+        This module combines your **Field Data** (Spatial Results) with **Pedigree Data** to calculate Breeding Values.
+        It borrows strength from relatives to improve accuracy.
+        
+        * **Input:** Spatially corrected values from Tab 3.
+        * **Relationship:** Calculated using Male/Female columns (Numerator Relationship Matrix).
+        """)
+        
+        # 1. Check if Previous Step is Done
+        if st.session_state.results_df is None:
+            st.warning("⚠️ Please run the 'Genotype Performance' analysis (Tab 3) first.")
+        else:
+            # 2. Configuration
+            c1, c2 = st.columns(2)
+            with c1:
+                target_trait = st.selectbox("Select Trait", [st.session_state.trait_ran], disabled=True)
+                data_source = st.selectbox("Genetic Information Source", ["Pedigree (Male/Female Cols)", "Marker Data (Genotyping)"])
+                
+            with c2:
+                st.write("")
+                st.write("") 
+                if data_source == "Marker Data (Genotyping)":
+                    st.caption("🔒 **Coming Soon...** Marker-based G-BLUP is under development.")
+                    run_ablup = False
+                else:
+                    if col_map['male'] == "Select Column..." or col_map['female'] == "Select Column...":
+                        st.error("🛑 Parental columns are not mapped.")
+                        run_ablup = False
+                    else:
+                        st.caption(f"✅ Using **{col_map['male']}** and **{col_map['female']}** to build Relationship Matrix.")
+                        run_ablup = st.button("🚀 Run A-BLUP Analysis", type="primary")
+
+            # 3. Execution
+            if run_ablup:
+                progress_log = [] # Capture matrix build logs
+                
+                with st.spinner("Building Pedigree Matrix & Solving Mixed Model..."):
+                    # A. Build A-Matrix
+                    t0 = time.time()
+                    a_mat = get_pedigree_matrix(df_clean, col_map['geno'], col_map['male'], col_map['female'])
+                    t1 = time.time()
+                    
+                    progress_log.append("--- MATRIX CONSTRUCTION LOG ---")
+                    progress_log.append(f"Time to build: {round(t1-t0, 2)} seconds")
+                    progress_log.append(f"Total Matrix Dimensions: {a_mat.shape}")
+                    # Safe checks for logging stats
+                    if a_mat.size > 0:
+                        progress_log.append(f"Average Relationship (Diagonal): {np.diag(a_mat).mean():.4f} (Expected ~1.0)")
+                        off_diag_vals = a_mat.values[~np.eye(a_mat.shape[0],dtype=bool)]
+                        if len(off_diag_vals) > 0:
+                            progress_log.append(f"Average Relationship (Off-Diagonal): {np.nanmean(off_diag_vals):.4f}")
+                    
+                    # OPTIONAL: Show Matrix Heatmap
+                    st.subheader("1. Genetic Relationship Matrix (A-Matrix)")
+                    st.caption("Darker Red = Higher Genetic Relatedness (Siblings). Blue = Unrelated.")
+                    
+                    # --- Matrix Download Button ---
+                    st.download_button(
+                        label="💾 Download Raw Matrix (CSV)",
+                        data=a_mat.to_csv().encode('utf-8'),
+                        file_name=f"Relationship_Matrix_{target_trait}.csv",
+                        mime='text/csv',
+                        help="Download the N x N calculated relationship matrix for validation."
+                    )
+                    
+                    with st.expander("View Matrix Heatmap", expanded=True):
+                        # Filter to show ONLY Trial Genotypes (Hybrids)
+                        trial_genos = df_clean[col_map['geno']].unique()
+                        valid_genos = [g for g in trial_genos if g in a_mat.index]
+                        hybrid_mat = a_mat.loc[valid_genos, valid_genos]
+
+                        # Dynamic Plot
+                        dyn_height = max(600, len(hybrid_mat) * 15) 
+                        
+                        fig_a = px.imshow(hybrid_mat, color_continuous_scale='RdBu_r', origin='lower', 
+                                        title=f"Genetic Relatedness (All {len(hybrid_mat)} Hybrids)")
+                        fig_a.update_layout(height=dyn_height, dragmode='zoom')
+                        st.plotly_chart(fig_a, use_container_width=True)
+
+                    # B. Run Model
+                    spatial_inputs = st.session_state.results_df
+                    success, ablup_res, model_log = run_ablup_model(spatial_inputs, a_mat, st.session_state.trait_ran)
+                    
+                    if success:
+                        st.subheader("2. Predicted Breeding Values (GEBV)")
+                        
+                        ablup_res = ablup_res.sort_values("GEBV_Breeding_Value", ascending=False).round(3)
+                        st.dataframe(
+                            ablup_res.style.background_gradient(subset=['GEBV_Breeding_Value'], cmap="Greens"),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        st.download_button(
+                            "Download A-BLUP Results",
+                            ablup_res.to_csv(index=False).encode('utf-8'),
+                            f"ABLUP_{st.session_state.trait_ran}.csv"
+                        )
+                        
+                        # --- DEBUG OUTPUT SECTION ---
+                        st.divider()
+                        with st.expander("Model Outputs & Logs (Detailed Stats)", expanded=False):
+                            # Combine Matrix Logs + Model Logs
+                            full_log = "\n".join(progress_log) + "\n\n" + model_log
+                            st.text(full_log)
+                            
+                    else:
+                        st.error(f"Analysis Failed: {model_log}")
 
 if __name__ == "__main__":
     main()
