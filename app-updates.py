@@ -350,11 +350,16 @@ def get_pedigree_matrix(df, geno_col, male_col, female_col):
 def run_ablup_model(pheno_df, a_matrix, trait_col):
     """
     Runs Stage 2: A-BLUP using Spatially Corrected Phenotypes + A-Matrix.
-    Uses Ridge Regression (sklearn) as a proxy for GBLUP/A-BLUP.
+    Returns: success (bool), results (df), log (str)
     """
+    log = []
+    log.append("--- A-BLUP MODEL LOG ---")
+    
     # 1. Align Data
-    # Filter A-matrix to only include genotypes present in the phenotypic data
     common_genos = list(set(pheno_df.index) & set(a_matrix.index))
+    log.append(f"Genotypes in Phenotype Data: {len(pheno_df)}")
+    log.append(f"Genotypes in Pedigree Matrix: {len(a_matrix)}")
+    log.append(f"Overlapping Genotypes (N): {len(common_genos)}")
     
     if len(common_genos) < 2:
         return False, None, "Not enough overlapping genotypes between Pedigree and Field Data."
@@ -363,27 +368,43 @@ def run_ablup_model(pheno_df, a_matrix, trait_col):
     if pheno_df.index.duplicated().any():
         y = pheno_df.groupby(level=0)[f"Predicted_{trait_col}"].mean()
         y = y.loc[common_genos]
+        log.append("Note: Duplicate genotypes found in spatial results. Averaged their BLUEs.")
     else:
         y = pheno_df.loc[common_genos, f"Predicted_{trait_col}"]
 
     K = a_matrix.loc[common_genos, common_genos] # The Kinship Kernel
     
-    # 2. Run Kernel Ridge Regression (Equivalent to GBLUP)
-    # alpha here represents Ve/Vg (Inverse Heritability). 
-    # In a full app, we might optimize this, but 1.0 is a safe robust default.
-    model = Ridge(alpha=1.0, fit_intercept=True)
+    # 2. Run Kernel Ridge Regression
+    # alpha = Ve/Vg. Defaulting to 1.0 (Assuming H2 = 0.5) for stability in this MVP.
+    alpha_val = 1.0 
+    model = Ridge(alpha=alpha_val, fit_intercept=True)
     model.fit(K, y)
     
     # 3. Predict (GEBV)
-    gebv = model.predict(K)
+    # In Ridge, the 'dual_coef_' * Kernel gives the random effects (Breeding Values)
+    # However, model.predict(K) returns Fixed Intercept + Random Effects
+    preds = model.predict(K)
+    
+    # Calculate pure Breeding Value (GEBV) by subtracting intercept
+    intercept = model.intercept_
+    gebvs = preds - intercept
+    
+    log.append(f"\nModel Parameters:")
+    log.append(f"  Trait: {trait_col}")
+    log.append(f"  Solver: Ridge Regression (scikit-learn)")
+    log.append(f"  Shrinkage Parameter (alpha): {alpha_val}")
+    log.append(f"  Estimated Intercept (Grand Mean): {intercept:.4f}")
+    log.append(f"  Mean GEBV: {np.mean(gebvs):.4f}")
+    log.append(f"  Min/Max GEBV: {np.min(gebvs):.4f} / {np.max(gebvs):.4f}")
     
     results = pd.DataFrame({
         'Genotype': common_genos,
         'Spatially_Corrected_Phenotype': y.values,
-        'GEBV_Breeding_Value': gebv
+        'GEBV_Breeding_Value': gebvs,
+        'Total_Predicted_Value': preds
     })
     
-    return True, results, "Model Converged"
+    return True, results, "\n".join(log)
 
 # --- MAIN APP ---
 
@@ -666,32 +687,31 @@ def main():
         st.info("""
         **What is this?**
         This module combines your **Field Data** (Spatial Results) with **Pedigree Data** to calculate Breeding Values.
-        It borrows strength from relatives to improve accuracy and predict performance.
+        It borrows strength from relatives to improve accuracy.
         
-        * **Input:** Spatially corrected values from the "Genotype Performance" tab.
-        * **Relationship:** Calculated using the Male/Female columns (Numerator Relationship Matrix).
+        * **Input:** Spatially corrected values from Tab 3.
+        * **Relationship:** Calculated using Male/Female columns (Numerator Relationship Matrix).
         """)
         
         # 1. Check if Previous Step is Done
         if st.session_state.results_df is None:
-            st.warning("⚠️ Please run the 'Genotype Performance' analysis (Tab 3) first to generate spatially corrected data.")
+            st.warning("⚠️ Please run the 'Genotype Performance' analysis (Tab 3) first.")
         else:
             # 2. Configuration
             c1, c2 = st.columns(2)
             with c1:
-                target_trait = st.selectbox("Select Trait", [st.session_state.trait_ran], disabled=True, help="Using the trait analyzed in Tab 3")
+                target_trait = st.selectbox("Select Trait", [st.session_state.trait_ran], disabled=True)
                 data_source = st.selectbox("Genetic Information Source", ["Pedigree (Male/Female Cols)", "Marker Data (Genotyping)"])
                 
             with c2:
                 st.write("")
-                st.write("") # Spacing
+                st.write("") 
                 if data_source == "Marker Data (Genotyping)":
                     st.caption("🔒 **Coming Soon...** Marker-based G-BLUP is under development.")
                     run_ablup = False
                 else:
-                    # Check if Parents exist
                     if col_map['male'] == "Select Column..." or col_map['female'] == "Select Column...":
-                        st.error("🛑 Parental columns are not mapped. Please map 'Male' and 'Female' in the sidebar.")
+                        st.error("🛑 Parental columns are not mapped.")
                         run_ablup = False
                     else:
                         st.caption(f"✅ Using **{col_map['male']}** and **{col_map['female']}** to build Relationship Matrix.")
@@ -699,30 +719,58 @@ def main():
 
             # 3. Execution
             if run_ablup:
+                progress_log = [] # Capture matrix build logs
+                
                 with st.spinner("Building Pedigree Matrix & Solving Mixed Model..."):
                     # A. Build A-Matrix
+                    t0 = time.time()
                     a_mat = get_pedigree_matrix(df_clean, col_map['geno'], col_map['male'], col_map['female'])
+                    t1 = time.time()
+                    
+                    progress_log.append("--- MATRIX CONSTRUCTION LOG ---")
+                    progress_log.append(f"Time to build: {round(t1-t0, 2)} seconds")
+                    progress_log.append(f"Total Matrix Dimensions: {a_mat.shape}")
+                    # Safe checks for logging stats
+                    if a_mat.size > 0:
+                        progress_log.append(f"Average Relationship (Diagonal): {np.diag(a_mat).mean():.4f} (Expected ~1.0)")
+                        off_diag_vals = a_mat.values[~np.eye(a_mat.shape[0],dtype=bool)]
+                        if len(off_diag_vals) > 0:
+                            progress_log.append(f"Average Relationship (Off-Diagonal): {np.nanmean(off_diag_vals):.4f}")
                     
                     # OPTIONAL: Show Matrix Heatmap
                     st.subheader("1. Genetic Relationship Matrix (A-Matrix)")
-                    st.caption("This heatmap shows how related the genotypes are. Darker red = Highly related (Siblings/Self).")
+                    st.caption("Darker Red = Higher Genetic Relatedness (Siblings). Blue = Unrelated.")
+                    
+                    # --- Matrix Download Button ---
+                    st.download_button(
+                        label="💾 Download Raw Matrix (CSV)",
+                        data=a_mat.to_csv().encode('utf-8'),
+                        file_name=f"Relationship_Matrix_{target_trait}.csv",
+                        mime='text/csv',
+                        help="Download the N x N calculated relationship matrix for validation."
+                    )
+                    
                     with st.expander("View Matrix Heatmap", expanded=True):
-                        # Downsample for viz if huge
-                        viz_mat = a_mat if len(a_mat) < 50 else a_mat.iloc[:50, :50] 
-                        fig_a = px.imshow(viz_mat, color_continuous_scale='RdBu_r', origin='lower', 
-                                        title=f"Genetic Relatedness (Top {len(viz_mat)} entries)")
+                        # Filter to show ONLY Trial Genotypes (Hybrids)
+                        trial_genos = df_clean[col_map['geno']].unique()
+                        valid_genos = [g for g in trial_genos if g in a_mat.index]
+                        hybrid_mat = a_mat.loc[valid_genos, valid_genos]
+
+                        # Dynamic Plot
+                        dyn_height = max(600, len(hybrid_mat) * 15) 
+                        
+                        fig_a = px.imshow(hybrid_mat, color_continuous_scale='RdBu_r', origin='lower', 
+                                        title=f"Genetic Relatedness (All {len(hybrid_mat)} Hybrids)")
+                        fig_a.update_layout(height=dyn_height, dragmode='zoom')
                         st.plotly_chart(fig_a, use_container_width=True)
 
                     # B. Run Model
-                    # Prepare spatial inputs: We index by Genotype to match A-Matrix
                     spatial_inputs = st.session_state.results_df
-                    
-                    success, ablup_res, msg = run_ablup_model(spatial_inputs, a_mat, st.session_state.trait_ran)
+                    success, ablup_res, model_log = run_ablup_model(spatial_inputs, a_mat, st.session_state.trait_ran)
                     
                     if success:
                         st.subheader("2. Predicted Breeding Values (GEBV)")
                         
-                        # Styling and Sort
                         ablup_res = ablup_res.sort_values("GEBV_Breeding_Value", ascending=False).round(3)
                         st.dataframe(
                             ablup_res.style.background_gradient(subset=['GEBV_Breeding_Value'], cmap="Greens"),
@@ -735,8 +783,16 @@ def main():
                             ablup_res.to_csv(index=False).encode('utf-8'),
                             f"ABLUP_{st.session_state.trait_ran}.csv"
                         )
+                        
+                        # --- DEBUG OUTPUT SECTION ---
+                        st.divider()
+                        with st.expander("Model Outputs & Logs (Detailed Stats)", expanded=False):
+                            # Combine Matrix Logs + Model Logs
+                            full_log = "\n".join(progress_log) + "\n\n" + model_log
+                            st.text(full_log)
+                            
                     else:
-                        st.error(f"Analysis Failed: {msg}")
+                        st.error(f"Analysis Failed: {model_log}")
 
 if __name__ == "__main__":
     main()
